@@ -1,9 +1,11 @@
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 
 import discord
+from aiohttp import web
 from discord.ext import commands
 from google.genai import types
 
@@ -185,6 +187,27 @@ async def write_entries_to_sheet(
 # Event handlers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Health check server (keeps Railway happy — it expects an open port)
+# ---------------------------------------------------------------------------
+
+async def _health_check(request: web.Request) -> web.Response:
+    return web.Response(text="OK")
+
+
+async def start_health_server() -> None:
+    """Start a minimal HTTP server so Railway's network check passes."""
+    port = int(os.environ.get("PORT", 8080))
+    app = web.Application()
+    app.router.add_get("/", _health_check)
+    app.router.add_get("/health", _health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("Health check server listening on port %d", port)
+
+
 @bot.event
 async def on_ready():
     logger.info("Bot is ready! Logged in as %s (ID: %s)", bot.user.name, bot.user.id)
@@ -192,6 +215,12 @@ async def on_ready():
         logger.info("Listening for messages in channel %s", CHANNEL_ID)
     else:
         logger.warning("CHANNEL_ID not set — bot will not process any messages")
+
+
+@bot.event
+async def setup_hook():
+    """Called when the bot is starting up, before connecting to Discord."""
+    await start_health_server()
 
 
 @bot.event
