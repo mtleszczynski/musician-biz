@@ -10,3 +10,8 @@ primary_region = 'lax'
   size = 'shared-cpu-1x'
   memory = '256mb'
   auto_stop_machines = 'off'
+
+[deploy]
+  # Discord bot must have exactly 1 instance — multiple instances
+  # cause duplicate message processing and race conditions.
+  strategy = 'immediate'
