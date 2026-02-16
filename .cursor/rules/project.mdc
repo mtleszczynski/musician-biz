@@ -1,0 +1,44 @@
+---
+description: Project-wide rules for the Musician Expense Tracker Discord bot
+globs: "**/*.py"
+alwaysApply: true
+---
+
+# Musician Expense Tracker — Cursor Rules
+
+## Project Overview
+Discord bot for a musician/music teacher to track income & expenses via photos, text,
+and audio messages. Uses Gemini 3 Flash for data extraction, Google Sheets for storage.
+
+## Architecture Awareness
+- `main.py` — Discord bot, event handlers, commands. This is the entry point.
+- `gemini_processor.py` — Gemini API calls. Uses `google-genai` SDK (NOT `google-generativeai`).
+- `sheets_manager.py` — Google Sheets via `gspread`. Sync library wrapped in `asyncio.to_thread()`.
+- `prompts.py` — System prompts AND Pydantic response models. These are tightly coupled.
+- `config.py` — Env var loading. Keep this minimal.
+
+## Coding Conventions
+- Python 3.11+ with type hints on all functions.
+- Async/await for all I/O operations. The Discord bot loop is async.
+- Use `logging` module, never `print()`.
+- Handle exceptions in Discord event handlers — never let them crash the bot.
+  Report errors to the user in the Discord thread.
+- Keep imports sorted: stdlib → third-party → local.
+
+## Key Libraries
+- `discord.py` — Discord bot framework. Use `commands.Bot`, not raw `Client`.
+- `google-genai` — Gemini API. Use `client.aio.models.generate_content()` for async.
+  Use `types.Part.from_bytes()` for inline image/audio data.
+  Use `response_schema=PydanticModel` for structured JSON output.
+- `gspread` — Google Sheets. Synchronous — always wrap in `asyncio.to_thread()`.
+
+## Important Reminders
+- When changing the Pydantic models in `prompts.py`, also update the system prompt text
+  to match (they must stay in sync about categories, field meanings, etc.).
+- When changing the Google Sheet columns, update BOTH `sheets_manager.HEADERS` and
+  `sheets_manager.append_entry()`.
+- After any architectural change, UPDATE `AGENTS.md` in the project root.
+- Discord voice messages use the IS_VOICE_MESSAGE flag (bit 13). Handle them in
+  `download_attachments()`.
+- The bot uses in-memory `pending_entries` dict — entries are lost on restart.
+  This is acceptable for an MVP but should be noted.
