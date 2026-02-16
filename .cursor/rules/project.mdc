@@ -8,16 +8,18 @@ alwaysApply: true
 
 ## Project Overview
 Discord bot for a musician/music teacher to track income & expenses via photos, text,
-and audio messages. Uses Gemini 3 Flash for data extraction, Google Sheets for storage.
-High-confidence entries are auto-saved; low-confidence entries prompt for clarification.
+and audio messages. Uses Gemini 3 Flash for data extraction, Google Sheets for storage,
+SQLite for persistent state. High-confidence entries are auto-saved; low-confidence
+entries prompt for clarification. Corrections use field-level updates, not full re-extraction.
 
 ## Architecture Awareness
-- `main.py` — Discord bot, event handlers, auto-confirm flow, commands. Entry point.
-- `gemini_processor.py` — Gemini API calls. Uses `google-genai` SDK (NOT `google-generativeai`).
-- `sheets_manager.py` — Google Sheets via `gspread`. Two tabs: "Entries" + "Conversation Log".
-  Sync library wrapped in `asyncio.to_thread()`.
-- `prompts.py` — System prompts AND Pydantic response models. These are tightly coupled.
-- `config.py` — Env var loading. Handles full Sheet URLs automatically.
+- `main.py` — Thin Discord event dispatcher. Downloads attachments, manages emoji, creates threads. Delegates all logic to entry_manager.
+- `entry_manager.py` — Entry lifecycle orchestration. Creates entries, processes corrections, confirms, saves. The central coordination layer.
+- `gemini_processor.py` — Gemini API calls. Uses `google-genai` SDK (NOT `google-generativeai`). Transcribes audio, describes images, extracts data, processes field-level corrections.
+- `sheets_manager.py` — Google Sheets via `gspread`. Two tabs: "Entries" + "Conversation Log". Supports append, update-in-place, and safe-replace. Sync library wrapped in `asyncio.to_thread()`.
+- `db.py` — SQLite via `aiosqlite`. Three tables: conversations (entry state), media_cache (transcriptions/descriptions), conversation_messages (thread history).
+- `prompts.py` — System prompts AND Pydantic response models. Models: FinancialEntry, ExtractionResult (initial extraction), FieldUpdate, FollowupResult (corrections). Tightly coupled with prompt text.
+- `config.py` — Env var loading + `setup_logging()`. Handles full Sheet URLs automatically.
 
 ## Spreadsheet Schema
 Entries tab columns: Date, Type, Category, Client/Event, Vendor, Mode of Payment,
@@ -32,7 +34,7 @@ Client/Event and Mode of Payment are income-only. Vendor is expense-only.
 ## Coding Conventions
 - Python 3.11+ with type hints on all functions.
 - Async/await for all I/O operations. The Discord bot loop is async.
-- Use `logging` module, never `print()`.
+- Use `logging` module with structured context: `thread=X op=Y | message`.
 - Handle exceptions in Discord event handlers — never let them crash the bot.
   Report errors to the user in the Discord thread.
 - Keep imports sorted: stdlib → third-party → local.
@@ -43,6 +45,7 @@ Client/Event and Mode of Payment are income-only. Vendor is expense-only.
   Use `types.Part.from_bytes()` for inline image/audio data.
   Use `response_schema=PydanticModel` for structured JSON output.
 - `gspread` — Google Sheets. Synchronous — always wrap in `asyncio.to_thread()`.
+- `aiosqlite` — Async SQLite. Used in db.py for persistent state.
 
 ## Emoji Reactions
 - Hourglass: processing
@@ -50,13 +53,22 @@ Client/Event and Mode of Payment are income-only. Vendor is expense-only.
 - Speech bubble: waiting for user clarification
 - Red X: actual error only (never for "needs input")
 
+## Critical Design Rules
+- **Corrections use field-level updates** (FollowupResult with FieldUpdate list), NOT full re-extraction. Never re-evaluate fields the user didn't mention.
+- **Never delete sheet rows before new rows are written.** Use update-in-place for same-count corrections, safe-replace (write-then-delete) for count changes.
+- **Audio is transcribed once and cached in SQLite.** Never re-send raw audio bytes to Gemini after the initial transcription.
+- **All conversation state lives in SQLite (db.py).** No in-memory dicts for pending entries. Bot restarts are instant — no reconstruction needed.
+
 ## Important Reminders
 - When changing the Pydantic models in `prompts.py`, also update the system prompt text
   to match (they must stay in sync about categories, field meanings, etc.).
-- When changing the Google Sheet columns, update BOTH `sheets_manager.HEADERS` and
-  `sheets_manager.append_entry()`.
+- When changing the Google Sheet columns, update `sheets_manager.HEADERS` and
+  `sheets_manager._build_row()`.
 - After any architectural change, UPDATE `AGENTS.md` in the project root.
 - Confidence is based on structured fields only (Date through Amount).
   Description and Notes are best-effort and never lower confidence.
-- The bot uses in-memory `pending_entries` dict — entries are lost on restart.
-  This is acceptable for an MVP but should be noted.
+
+## Deployment
+- Hosted on **Fly.io** (NOT Railway). See fly.toml and Dockerfile.
+- SQLite database stored on a Fly.io persistent volume mounted at `/data`.
+- Set `DB_PATH=/data/bot.db` in Fly.io secrets for production.

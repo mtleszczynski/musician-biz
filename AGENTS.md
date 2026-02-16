@@ -13,7 +13,7 @@ to a Google Sheet, and asks clarifying questions in a Discord thread when unsure
 ## Architecture
 
 ```
-Discord Channel ──message──▶ Discord Bot (main.py)
+Discord Channel ──message──▶ main.py (thin dispatcher)
                                 │
                     ┌───────────┼───────────┐
                     ▼           ▼           ▼
@@ -22,21 +22,40 @@ Discord Channel ──message──▶ Discord Bot (main.py)
                     │           │           │
                     └───────────┼───────────┘
                                 ▼
-                     Gemini 3 Flash (gemini_processor.py)
-                     structured JSON extraction
-                                │
-                    ┌───────────┴───────────┐
-                    ▼                       ▼
-              High confidence         Low confidence
-              Auto-save to sheet      Ask in thread
-                    │                       │
-                    ▼                       ▼
-              Google Sheets           User clarifies
-              "Entries" tab           then → auto-save
+                     entry_manager.py (orchestration)
+                    ┌───────────┼───────────┐
+                    ▼           ▼           ▼
+              gemini_processor  db.py     sheets_manager
+              (transcribe,    (SQLite)   (Google Sheets)
+               extract,
+               correct)
                     │
                     ▼
-              "Conversation Log" tab
+              prompts.py (system prompts + Pydantic models)
 ```
+
+### Data Flow — New Entry
+1. User sends message → main.py downloads attachments, creates thread
+2. entry_manager.create_entry() orchestrates everything:
+   - Transcribes audio via Gemini (cached in SQLite, never re-sent as bytes)
+   - Describes images via Gemini (cached in SQLite for followup corrections)
+   - Extracts financial data via Gemini (images sent as bytes for accuracy)
+   - Stores conversation state in SQLite
+   - If confident: saves to Google Sheet, returns "saved" result
+   - If uncertain: returns "needs clarification" result with questions
+3. main.py posts the response in the thread and sets emoji
+
+### Data Flow — Thread Reply (Correction)
+1. User replies in thread → main.py downloads any new attachments
+2. entry_manager.process_reply() orchestrates:
+   - Loads conversation state from SQLite (instant, no re-downloading)
+   - If confirmation word: saves existing entries to sheet
+   - If new media: full extraction of new content only
+   - If text correction: **field-level update** via Gemini (NOT full re-extraction)
+     - Gemini identifies ONLY the fields to change
+     - Unchanged fields stay locked (no regression)
+   - Updates sheet in-place (no delete-then-append)
+3. main.py posts response and updates emoji
 
 ## Key Decisions and Rationale
 
@@ -45,22 +64,28 @@ Discord Channel ──message──▶ Discord Bot (main.py)
 | Chat platform | Discord | Free, excellent thread support for tracking conversations per entry |
 | LLM | Gemini 3 Flash | Multimodal (vision+audio+text), thinking/reasoning, cheap, free tier |
 | Data store | Google Sheets | User wanted spreadsheet for taxes, easy to share with accountant |
+| Local state | SQLite (aiosqlite) | Persistent across restarts, no external DB service needed |
 | Language | Python 3.11+ | Best Discord bot ecosystem (discord.py), good Google API support |
-| Hosting | Railway | Discord bots need persistent WebSocket — Vercel is serverless, can't do this |
+| Hosting | Fly.io | Discord bots need persistent WebSocket; Fly.io supports volumes for SQLite |
 | Sheets auth | Service account | No OAuth flow needed, just share sheet with service account email |
 | Structured output | Pydantic + response_schema | Forces Gemini to return valid JSON matching our schema |
 | Auto-confirm | Yes, at high confidence | Reduces friction — user doesn't have to type "yes" every time |
+| Corrections | Field-level updates | Prevents regression of already-correct fields |
+| Sheet updates | In-place update | Prevents data loss from delete-before-write pattern |
+| Audio | Transcribe once, cache | Avoids re-sending slow audio bytes on every followup |
 
 ## File Responsibilities
 
 | File | Purpose |
 |------|---------|
-| `main.py` | Discord bot entry point. Event handlers, commands, auto-confirm flow, emoji reactions |
-| `gemini_processor.py` | Gemini API integration. Sends multimodal content, returns structured ExtractionResult |
-| `sheets_manager.py` | Google Sheets: Entries tab (financial data) + Conversation Log tab (interaction history) |
-| `prompts.py` | System prompts for Gemini + Pydantic models (FinancialEntry, ExtractionResult) |
-| `config.py` | Environment variable loading (auto-extracts spreadsheet ID from full URLs) |
-| `Procfile` / `railway.toml` | Railway deployment configuration |
+| `main.py` | Discord event dispatcher. Downloads attachments, manages emoji, creates threads. Thin — all logic delegated to entry_manager. |
+| `entry_manager.py` | Entry lifecycle orchestration. Creates entries, processes corrections, confirms, saves. Coordinates db + gemini + sheets. |
+| `gemini_processor.py` | Gemini API integration. Transcribes audio, describes images, extracts financial data, processes field-level corrections. |
+| `sheets_manager.py` | Google Sheets CRUD. Append, update-in-place, safe-replace. Two tabs: "Entries" + "Conversation Log". Sync gspread wrapped in asyncio.to_thread(). |
+| `db.py` | SQLite persistence. Conversations (entry state), media_cache (transcriptions/descriptions), conversation_messages (thread history). |
+| `prompts.py` | System prompts + Pydantic models. FinancialEntry, ExtractionResult (initial), FieldUpdate, FollowupResult (corrections). Tightly coupled with prompts. |
+| `config.py` | Environment variable loading + logging setup. |
+| `Dockerfile` / `fly.toml` | Fly.io deployment configuration with persistent volume for SQLite. |
 
 ## Spreadsheet Schema ("Entries" tab)
 
@@ -88,24 +113,13 @@ Discord Channel ──message──▶ Discord Bot (main.py)
 | Outcome | auto-confirmed, user-confirmed, corrected, or error |
 | Discord Link | Link to the thread |
 
-## Data Flow for a New Entry
+## SQLite Schema (db.py)
 
-1. User sends message in the configured Discord channel
-2. `on_message` in `main.py` calls `handle_new_entry()`
-3. Bot reacts with ⏳ (hourglass), creates a thread, downloads attachments
-4. `gemini_processor.extract_financial_data()` sends content to Gemini 3 Flash
-5. Gemini returns `ExtractionResult` (entries, confidence, clarifying questions)
-6. **If confident** (>= threshold, no clarifying questions):
-   - Auto-saves to Entries tab immediately
-   - Posts "Saved!" summary in thread
-   - Reacts with ✅ on original message
-   - Logs to Conversation Log as "auto-confirmed"
-7. **If uncertain** (low confidence or has questions):
-   - Posts summary + clarifying questions in thread
-   - Reacts with 💬 (speech bubble) on original message
-   - User replies → `handle_thread_reply()` re-extracts
-   - Once confident → saves, reacts ✅, logs to Conversation Log
-8. **On error**: reacts with ❌ (only for actual crashes, never for "needs input")
+| Table | Purpose |
+|-------|---------|
+| conversations | Entry state: thread_id, entries JSON, confidence, status, sheet row numbers |
+| media_cache | Cached transcriptions (audio) and descriptions (images) by message_id |
+| conversation_messages | Full thread history (role + content) for Gemini context in corrections |
 
 ## Emoji Reactions Guide
 
@@ -127,12 +141,23 @@ Discord Channel ──message──▶ Discord Bot (main.py)
 | `GOOGLE_CREDENTIALS_JSON` | Yes | Service account creds (JSON string or file path) |
 | `GEMINI_MODEL` | No | Model name (default: `gemini-3-flash-preview`) |
 | `CONFIDENCE_THRESHOLD` | No | Min confidence for auto-confirm (default: `0.8`) |
+| `DB_PATH` | No | SQLite database path (default: `./bot.db` locally, set to `/data/bot.db` on Fly.io) |
+
+## Deployment (Fly.io)
+
+The bot runs on Fly.io with a persistent volume for the SQLite database.
+
+- `fly.toml` — App config with `[mounts]` for the `/data` volume
+- `Dockerfile` — Python 3.11-slim, creates `/data` directory
+- Volume must be created once: `fly volumes create bot_data --region lax --size 1`
+- Set `DB_PATH=/data/bot.db` in Fly.io secrets
+- Deploy: `fly deploy`
 
 ## Common Tasks
 
 ### Adding a new category
 Edit the category lists in `prompts.py` (both in `FinancialEntry.category` field description
-and in `EXTRACTION_SYSTEM_PROMPT`).
+and in `EXTRACTION_SYSTEM_PROMPT` and `CORRECTION_SYSTEM_PROMPT`).
 
 ### Changing the LLM model
 Set the `GEMINI_MODEL` env var. No code changes needed.
@@ -142,16 +167,20 @@ Add a `@bot.command()` function in `main.py`, following the pattern of existing 
 
 ### Adding a new column to the spreadsheet
 1. Add the column name to `HEADERS` in `sheets_manager.py`
-2. Add the field to `append_entry()` and the row list in `sheets_manager.py`
+2. Update `_build_row()` in `sheets_manager.py`
 3. If it comes from Gemini, add it to the `FinancialEntry` Pydantic model in `prompts.py`
-4. Update `format_entry()` in `main.py` to display the new field
+4. Update `_format_entry()` in `entry_manager.py` to display the new field
 
 ## Conventions
 
 - **Async everywhere**: The Discord bot is async. Use `await` for all I/O.
   gspread is sync, so it's wrapped with `asyncio.to_thread()`.
-- **Logging**: Use the `logging` module, not `print()`.
+  SQLite uses aiosqlite (native async).
+- **Logging**: Use the `logging` module with structured context: `thread=X op=Y | message`.
+  Timing: log elapsed time for Gemini calls and sheet operations.
 - **Type hints**: All function signatures should have type hints.
 - **Error handling**: Catch exceptions in event handlers, report to user via Discord, log the traceback.
 - **Confidence**: Only structured fields (Date through Amount) affect confidence.
   Description and Notes are best-effort and never trigger clarification.
+- **Corrections**: Use field-level updates (FollowupResult), NOT full re-extraction.
+  Never delete sheet rows before new rows are written.

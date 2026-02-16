@@ -6,6 +6,10 @@ primary_region = 'lax'
 [processes]
   worker = 'python main.py'
 
+[mounts]
+  source = 'bot_data'
+  destination = '/data'
+
 [[vm]]
   size = 'shared-cpu-1x'
   memory = '256mb'

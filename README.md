@@ -11,8 +11,10 @@ extract the financial data and logs it to a Google Sheet.
 - **Text input** — type a quick note like "Sarah paid $50 for piano lesson"
 - **Smart categorization** — auto-categorizes income and expenses
 - **Clarifying questions** — if something is unclear, the bot asks in a Discord thread
+- **Field-level corrections** — fix one thing without re-entering everything else
 - **Google Sheets** — all data goes to a spreadsheet, with links back to the Discord conversation
 - **Monthly summaries** — `!summary` shows income/expense breakdown by category
+- **Persistent state** — bot remembers conversations across restarts (SQLite)
 
 ## Setup Guide
 
@@ -101,20 +103,41 @@ cp .env.example .env
 python main.py
 ```
 
-#### Option B: Deploy on Railway (recommended)
+#### Option B: Deploy on Fly.io (recommended)
 
-1. Go to [railway.app](https://railway.app) and sign in with GitHub
-2. Click **New Project → Deploy from GitHub Repo**
-3. Select the `mtleszczynski/musician-biz` repository
-4. Go to the **Variables** tab and add:
-   - `DISCORD_TOKEN` — your bot token
-   - `CHANNEL_ID` — your channel ID
-   - `GEMINI_API_KEY` — your Gemini API key
-   - `SPREADSHEET_ID` — your spreadsheet ID
-   - `GOOGLE_CREDENTIALS_JSON` — paste the **entire contents** of your service account JSON file
-5. Railway will auto-deploy. Check the **Logs** tab to verify the bot starts successfully.
+1. Install the Fly CLI: [fly.io/docs/flyctl/install](https://fly.io/docs/flyctl/install/)
 
-Future pushes to `main` will auto-deploy.
+2. Sign up / log in:
+   ```bash
+   fly auth login
+   ```
+
+3. Launch the app (first time only):
+   ```bash
+   fly launch
+   ```
+
+4. Create a persistent volume for the SQLite database:
+   ```bash
+   fly volumes create bot_data --region lax --size 1
+   ```
+
+5. Set your secrets:
+   ```bash
+   fly secrets set DISCORD_TOKEN=your_token
+   fly secrets set CHANNEL_ID=your_channel_id
+   fly secrets set GEMINI_API_KEY=your_key
+   fly secrets set SPREADSHEET_ID=your_sheet_id
+   fly secrets set GOOGLE_CREDENTIALS_JSON='{"type":"service_account",...}'
+   fly secrets set DB_PATH=/data/bot.db
+   ```
+
+6. Deploy:
+   ```bash
+   fly deploy
+   ```
+
+Future pushes can be deployed with `fly deploy`.
 
 ## Usage
 
@@ -147,4 +170,4 @@ Once the bot is running:
 - **Discord**: Free
 - **Gemini 3 Flash**: Has a free tier; paid tier is ~$0.50/1M input tokens — pennies/month for personal use
 - **Google Sheets API**: Free
-- **Railway**: ~$5/month (hobby plan)
+- **Fly.io**: ~$5/month (hobby plan), includes persistent volume

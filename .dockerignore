@@ -6,11 +6,5 @@ __pycache__
 *.pyo
 .cursor
 .vscode
-railway.toml
-Procfile
-README.md
-AGENTS.md
 *.md
-fly.toml
-Dockerfile
-.dockerignore
+bot.db
