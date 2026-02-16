@@ -291,29 +291,46 @@ async def process_reply(
     entries = conv["entries"]
     message_url = conv["message_url"]
 
-    # 2. Record user message
-    await db.add_message(thread_id, "user", user_text)
+    # 2. Transcribe/describe any media attachments into text
+    #    In a thread reply, media is a correction (voice note, updated receipt),
+    #    NOT a new financial entry. Transcribe to text and treat as a text correction.
+    correction_text = user_text
+    if audio:
+        audio_bytes, mime_type = audio
+        transcription = await gemini_processor.transcribe_audio(audio_bytes, mime_type)
+        if message_id:
+            await db.cache_media(message_id, "audio", transcription, mime_type)
+        correction_text = f"{user_text}\n[Audio]: {transcription}".strip()
+        logger.info(
+            "thread=%d op=process_reply | Transcribed voice reply: %s",
+            thread_id, transcription[:100],
+        )
 
-    # 3. Check for simple confirmation
+    if images:
+        for img_bytes, mime_type in images:
+            description = await gemini_processor.describe_image(img_bytes, mime_type)
+            if message_id:
+                await db.cache_media(message_id, "image", description, mime_type)
+            correction_text = f"{correction_text}\n[Image]: {description}".strip()
+
+    # 3. Record user message (with transcription context)
+    await db.add_message(thread_id, "user", correction_text)
+
+    # 4. Check for simple confirmation
+    text_to_check = correction_text.strip().lower()
     if (
-        user_text.strip().lower() in CONFIRM_WORDS
+        text_to_check in CONFIRM_WORDS
         and len(entries) > 0
         and conv["status"] != "saved"
     ):
         return await _confirm_and_save(thread_id, conv, t0)
-
-    # 4. Handle new media attachments
-    if images or audio:
-        return await _handle_new_media(
-            thread_id, conv, user_text, message_id, images, audio, t0
-        )
 
     # 5. Field-level correction via Gemini
     conversation_history = await db.get_messages(thread_id)
     followup = await gemini_processor.process_correction(
         current_entries=entries,
         conversation_history=conversation_history,
-        user_reply=user_text,
+        user_reply=correction_text,
     )
 
     # 6. Handle pure confirmation from Gemini
@@ -504,105 +521,3 @@ async def _save_entries(
     )
 
 
-async def _handle_new_media(
-    thread_id: int,
-    conv: dict,
-    user_text: str,
-    message_id: int | None,
-    images: list[tuple[bytes, str]] | None,
-    audio: tuple[bytes, str] | None,
-    t0: float,
-) -> ProcessingResult:
-    """Handle a reply that includes new media attachments.
-
-    Falls back to full extraction for genuinely new content, then
-    either saves or asks questions.
-    """
-    message_url = conv["message_url"]
-
-    # Transcribe new audio
-    audio_transcription: str | None = None
-    if audio:
-        audio_bytes, mime_type = audio
-        audio_transcription = await gemini_processor.transcribe_audio(
-            audio_bytes, mime_type
-        )
-        if message_id:
-            await db.cache_media(message_id, "audio", audio_transcription, mime_type)
-
-    # Describe new images
-    if images and message_id:
-        for img_bytes, mime_type in images:
-            description = await gemini_processor.describe_image(img_bytes, mime_type)
-            await db.cache_media(message_id, "image", description, mime_type)
-
-    # Full extraction of the new media
-    result = await gemini_processor.extract_financial_data(
-        text=user_text or None,
-        images=images,
-        audio_transcription=audio_transcription,
-    )
-
-    entries_dicts = [e.model_dump() for e in result.entries]
-
-    # Decide: replace existing entries or merge
-    # For simplicity, new media replaces the existing extraction
-    await db.update_conversation_entries(
-        thread_id=thread_id,
-        entries=entries_dicts,
-        confidence=result.confidence,
-        questions=result.clarifying_questions,
-        raw_summary=result.raw_summary,
-    )
-
-    is_confident = (
-        result.confidence >= CONFIDENCE_THRESHOLD
-        and not result.clarifying_questions
-        and len(result.entries) > 0
-    )
-
-    if is_confident:
-        # Save (handling existing rows safely)
-        old_rows = conv["sheet_row_numbers"]
-        if old_rows:
-            row_numbers = await sheets_manager.safe_replace_entries(
-                old_rows, entries_dicts, message_url
-            )
-        else:
-            row_numbers = await sheets_manager.append_entries(
-                entries_dicts, message_url
-            )
-        await db.update_conversation_status(thread_id, "saved", row_numbers)
-
-        response_text = _format_result_message(
-            entries_dicts, [], result.raw_summary, saved=True
-        )
-        await db.add_message(thread_id, "bot", response_text)
-
-        elapsed = time.monotonic() - t0
-        logger.info(
-            "thread=%d op=new_media | %.1fs, saved %d entries from new media",
-            thread_id, elapsed, len(row_numbers),
-        )
-
-        return ProcessingResult(
-            response_text=response_text,
-            status="saved",
-            entries_saved=len(row_numbers),
-        )
-    else:
-        response_text = _format_result_message(
-            entries_dicts, result.clarifying_questions, result.raw_summary, saved=False
-        )
-        await db.add_message(thread_id, "bot", response_text)
-
-        elapsed = time.monotonic() - t0
-        logger.info(
-            "thread=%d op=new_media | %.1fs, needs clarification from new media",
-            thread_id, elapsed,
-        )
-
-        return ProcessingResult(
-            response_text=response_text,
-            status="pending_clarification",
-        )
