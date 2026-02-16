@@ -224,6 +224,14 @@ async def handle_thread_reply(message: discord.Message):
     try:
         await message.add_reaction(EMOJI_PROCESSING)
 
+        # Immediately show processing on the original channel message too
+        try:
+            original_msg = message.channel.starter_message
+            if original_msg:
+                await set_reaction(original_msg, EMOJI_PROCESSING)
+        except Exception:
+            pass
+
         images, audio = await download_attachments(message)
         user_text = message.content.strip() if message.content else ""
 
