@@ -1,0 +1,16 @@
+.env
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+.cursor
+.vscode
+railway.toml
+Procfile
+README.md
+AGENTS.md
+*.md
+fly.toml
+Dockerfile
+.dockerignore

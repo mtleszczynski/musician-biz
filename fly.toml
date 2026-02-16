@@ -1,0 +1,12 @@
+app = 'musician-expenses-bot'
+primary_region = 'lax'
+
+[build]
+
+[processes]
+  worker = 'python main.py'
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '256mb'
+  auto_stop_machines = 'off'
