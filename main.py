@@ -25,6 +25,14 @@ logging.basicConfig(
 logger = logging.getLogger("musician-bot")
 
 # ---------------------------------------------------------------------------
+# Emoji constants
+# ---------------------------------------------------------------------------
+EMOJI_PROCESSING = "\u23f3"       # hourglass — working on it
+EMOJI_DONE = "\u2705"             # green checkmark — saved to sheet
+EMOJI_NEEDS_INPUT = "\U0001f4ac"  # speech bubble — waiting for user
+EMOJI_ERROR = "\u274c"            # red X — actual error/crash
+
+# ---------------------------------------------------------------------------
 # Pending entry tracking
 # ---------------------------------------------------------------------------
 
@@ -35,7 +43,8 @@ class PendingEntry:
     result: ExtractionResult
     original_parts: list[types.Part] = field(default_factory=list)
     original_message_url: str = ""
-    status: str = "pending"  # "pending_confirmation" | "pending_clarification"
+    original_text: str = ""
+    status: str = "pending"  # "pending_clarification"
 
 
 # thread_id -> PendingEntry
@@ -66,18 +75,28 @@ def format_entry(entry, index: int | None = None) -> str:
         f"• **Date:** {entry.date}",
         f"• **Type:** {entry.type.capitalize()}",
         f"• **Category:** {entry.category}",
-        f"• **Amount:** ${entry.amount:,.2f}",
-        f"• **Description:** {entry.description}",
     ]
-    if entry.student:
-        lines.append(f"• **Student:** {entry.student}")
-    if entry.payment_method:
-        lines.append(f"• **Payment:** {entry.payment_method}")
+    if entry.client_or_event:
+        lines.append(f"• **Client/Event:** {entry.client_or_event}")
+    if entry.vendor:
+        lines.append(f"• **Vendor:** {entry.vendor}")
+    if entry.mode_of_payment:
+        lines.append(f"• **Payment:** {entry.mode_of_payment}")
+    lines.append(f"• **Amount:** ${entry.amount:,.2f}")
+    if entry.description:
+        lines.append(f"• **Description:** {entry.description}")
+    if entry.notes:
+        lines.append(f"• **Notes:** {entry.notes}")
     return prefix + "\n".join(lines)
 
 
-def format_extraction_message(result: ExtractionResult) -> str:
-    """Build the full Discord message for an extraction result."""
+def format_extraction_message(result: ExtractionResult, saved: bool = False) -> str:
+    """Build the full Discord message for an extraction result.
+
+    Args:
+        result: The extraction result from Gemini.
+        saved: If True, this was auto-confirmed and already saved to the sheet.
+    """
     if not result.entries:
         msg = f"I wasn't able to extract any financial data.\n\n> {result.raw_summary}"
         if result.clarifying_questions:
@@ -87,7 +106,10 @@ def format_extraction_message(result: ExtractionResult) -> str:
         return msg
 
     count = len(result.entries)
-    header = f"**Here's what I found ({count} {'entry' if count == 1 else 'entries'}):**\n"
+    if saved:
+        header = f"**Saved {count} {'entry' if count == 1 else 'entries'} to the spreadsheet!**\n"
+    else:
+        header = f"**Here's what I found ({count} {'entry' if count == 1 else 'entries'}):**\n"
 
     entry_blocks = []
     for i, entry in enumerate(result.entries, start=1):
@@ -101,7 +123,7 @@ def format_extraction_message(result: ExtractionResult) -> str:
         for q in result.clarifying_questions:
             msg += f"• {q}\n"
         msg += "\nPlease answer the questions above, or tell me what to fix."
-    else:
+    elif not saved:
         msg += "\n\nReply **yes** to confirm, or tell me what needs to be corrected."
 
     return msg
@@ -110,12 +132,7 @@ def format_extraction_message(result: ExtractionResult) -> str:
 async def download_attachments(
     message: discord.Message,
 ) -> tuple[list[tuple[bytes, str]], tuple[bytes, str] | None]:
-    """Download image and audio attachments from a Discord message.
-
-    Returns:
-        (images, audio) where images is a list of (bytes, mime_type) tuples
-        and audio is a single (bytes, mime_type) tuple or None.
-    """
+    """Download image and audio attachments from a Discord message."""
     images: list[tuple[bytes, str]] = []
     audio: tuple[bytes, str] | None = None
 
@@ -126,16 +143,14 @@ async def download_attachments(
             data = await attachment.read()
             images.append((data, content_type))
             logger.info("Downloaded image: %s (%s)", attachment.filename, content_type)
-
         elif content_type in AUDIO_MIME_TYPES:
             data = await attachment.read()
             audio = (data, content_type)
             logger.info("Downloaded audio: %s (%s)", attachment.filename, content_type)
-
         else:
             logger.info("Skipping unsupported attachment: %s (%s)", attachment.filename, content_type)
 
-    # Discord voice messages are sometimes flagged differently
+    # Discord voice messages use a special flag
     if message.flags.value & (1 << 13):  # IS_VOICE_MESSAGE flag
         for attachment in message.attachments:
             if not audio:
@@ -162,9 +177,7 @@ def build_original_parts(
     return parts
 
 
-async def write_entries_to_sheet(
-    pending: PendingEntry,
-) -> int:
+async def write_entries_to_sheet(pending: PendingEntry) -> int:
     """Write all entries from a PendingEntry to Google Sheets. Returns count written."""
     count = 0
     for entry in pending.result.entries:
@@ -173,22 +186,33 @@ async def write_entries_to_sheet(
             entry_type=entry.type,
             category=entry.category,
             amount=entry.amount,
-            description=entry.description,
             discord_link=pending.original_message_url,
-            raw_summary=pending.result.raw_summary,
-            student=entry.student,
-            payment_method=entry.payment_method,
+            client_or_event=entry.client_or_event,
+            vendor=entry.vendor,
+            mode_of_payment=entry.mode_of_payment,
+            description=entry.description,
+            notes=entry.notes,
         )
         count += 1
     return count
 
 
-# ---------------------------------------------------------------------------
-# Event handlers
-# ---------------------------------------------------------------------------
+async def set_reaction(message: discord.Message, emoji: str) -> None:
+    """Clear all bot reactions and set a single new one."""
+    for reaction in message.reactions:
+        if reaction.me:
+            try:
+                await message.remove_reaction(reaction.emoji, bot.user)
+            except Exception:
+                pass
+    try:
+        await message.add_reaction(emoji)
+    except Exception:
+        logger.exception("Failed to set reaction %s", emoji)
+
 
 # ---------------------------------------------------------------------------
-# Health check server (keeps Railway happy — it expects an open port)
+# Health check server (keeps Railway happy)
 # ---------------------------------------------------------------------------
 
 async def _health_check(request: web.Request) -> web.Response:
@@ -208,6 +232,10 @@ async def start_health_server() -> None:
     logger.info("Health check server listening on port %d", port)
 
 
+# ---------------------------------------------------------------------------
+# Event handlers
+# ---------------------------------------------------------------------------
+
 @bot.event
 async def on_ready():
     logger.info("Bot is ready! Logged in as %s (ID: %s)", bot.user.name, bot.user.id)
@@ -225,19 +253,16 @@ async def setup_hook():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore messages from the bot itself
     if message.author == bot.user:
         return
 
-    # Process commands first (e.g., !summary, !undo)
     await bot.process_commands(message)
 
-    # Don't process command messages further
     ctx = await bot.get_context(message)
     if ctx.valid:
         return
 
-    # --- New message in the designated channel (not a thread) ---
+    # New message in the designated channel (not a thread)
     if (
         CHANNEL_ID
         and str(message.channel.id) == str(CHANNEL_ID)
@@ -245,7 +270,7 @@ async def on_message(message: discord.Message):
     ):
         await handle_new_entry(message)
 
-    # --- Follow-up message in a tracked thread ---
+    # Follow-up in a tracked thread
     elif isinstance(message.channel, discord.Thread) and message.channel.id in pending_entries:
         await handle_thread_reply(message)
 
@@ -253,55 +278,72 @@ async def on_message(message: discord.Message):
 async def handle_new_entry(message: discord.Message):
     """Process a new message in the expenses channel."""
     try:
-        # React to show we're processing
-        await message.add_reaction("\u23f3")  # hourglass
+        await message.add_reaction(EMOJI_PROCESSING)
 
-        # Download attachments
         images, audio = await download_attachments(message)
         text = message.content.strip() if message.content else None
 
         if not text and not images and not audio:
-            await message.remove_reaction("\u23f3", bot.user)
-            await message.add_reaction("\u2753")  # question mark
+            await set_reaction(message, "\u2753")  # question mark
             return
 
-        # Create a thread for this entry
+        # Create a thread
         thread = await message.create_thread(
             name=f"Entry {datetime.now().strftime('%b %d %H:%M')}",
-            auto_archive_duration=1440,  # 24 hours
+            auto_archive_duration=1440,
         )
 
-        # Send to Gemini for extraction
+        # Extract via Gemini
         result = await gemini_processor.extract_financial_data(
             text=text, images=images, audio=audio
         )
 
-        # Store pending entry
         original_parts = build_original_parts(text, images, audio)
-        status = (
-            "pending_confirmation"
-            if result.confidence >= CONFIDENCE_THRESHOLD and not result.clarifying_questions
-            else "pending_clarification"
-        )
-        pending_entries[thread.id] = PendingEntry(
-            result=result,
-            original_parts=original_parts,
-            original_message_url=message.jump_url,
-            status=status,
+        is_confident = (
+            result.confidence >= CONFIDENCE_THRESHOLD
+            and not result.clarifying_questions
+            and len(result.entries) > 0
         )
 
-        # Post the result in the thread
-        response_text = format_extraction_message(result)
-        await thread.send(response_text)
+        if is_confident:
+            # --- AUTO-CONFIRM: write to sheet immediately ---
+            pending = PendingEntry(
+                result=result,
+                original_parts=original_parts,
+                original_message_url=message.jump_url,
+                original_text=text or "",
+            )
+            count = await write_entries_to_sheet(pending)
 
-        # Update reaction
-        await message.remove_reaction("\u23f3", bot.user)
-        await message.add_reaction("\U0001f4cb")  # clipboard emoji — processing shown
+            response_text = format_extraction_message(result, saved=True)
+            await thread.send(response_text)
+            await set_reaction(message, EMOJI_DONE)
+
+            # Log to conversation log
+            await sheets_manager.log_conversation(
+                user_input=text or "(attachment)",
+                bot_response=response_text[:500],
+                outcome="auto-confirmed",
+                discord_link=message.jump_url,
+            )
+            logger.info("Auto-confirmed %d entries", count)
+
+        else:
+            # --- NEEDS CLARIFICATION: ask the user ---
+            pending_entries[thread.id] = PendingEntry(
+                result=result,
+                original_parts=original_parts,
+                original_message_url=message.jump_url,
+                original_text=text or "",
+                status="pending_clarification",
+            )
+            response_text = format_extraction_message(result, saved=False)
+            await thread.send(response_text)
+            await set_reaction(message, EMOJI_NEEDS_INPUT)
 
     except Exception:
         logger.exception("Error processing new entry")
-        await message.remove_reaction("\u23f3", bot.user)
-        await message.add_reaction("\u274c")  # X emoji
+        await set_reaction(message, EMOJI_ERROR)
         try:
             thread = await message.create_thread(name="Error", auto_archive_duration=60)
             await thread.send(
@@ -321,77 +363,110 @@ async def handle_thread_reply(message: discord.Message):
         user_text = message.content.strip().lower()
 
         # Check if user is confirming
-        if pending.status == "pending_confirmation" and user_text in CONFIRM_WORDS:
-            await message.add_reaction("\u23f3")
+        if user_text in CONFIRM_WORDS and len(pending.result.entries) > 0:
+            await message.add_reaction(EMOJI_PROCESSING)
 
             count = await write_entries_to_sheet(pending)
 
-            await message.remove_reaction("\u23f3", bot.user)
-            await message.channel.send(
-                f"Done! {count} {'entry' if count == 1 else 'entries'} "
-                f"added to the spreadsheet."
-            )
+            await message.remove_reaction(EMOJI_PROCESSING, bot.user)
+            response_text = format_extraction_message(pending.result, saved=True)
+            await message.channel.send(response_text)
 
-            # Update the original message reaction
+            # Update reaction on original message
             try:
                 original_channel = bot.get_channel(int(CHANNEL_ID))
                 if original_channel:
-                    # The thread's parent message
                     original_msg = message.channel.starter_message
                     if original_msg:
-                        await original_msg.remove_reaction("\U0001f4cb", bot.user)
-                        await original_msg.add_reaction("\u2705")  # green checkmark
+                        await set_reaction(original_msg, EMOJI_DONE)
             except Exception:
                 logger.exception("Could not update original message reaction")
 
-            # Clean up
+            # Log conversation
+            await sheets_manager.log_conversation(
+                user_input=pending.original_text or "(attachment)",
+                bot_response=response_text[:500],
+                outcome="user-confirmed",
+                discord_link=pending.original_message_url,
+            )
+
             del pending_entries[thread_id]
             return
 
         # User is providing corrections or answering questions
-        await message.add_reaction("\u23f3")
+        await message.add_reaction(EMOJI_PROCESSING)
 
-        # Also check for new attachments in the follow-up
         new_images, new_audio = await download_attachments(message)
         full_text = message.content.strip() if message.content else ""
 
         if new_images or new_audio:
-            # User sent additional media — do a fresh extraction combining old + new
             all_parts = list(pending.original_parts)
             new_parts = build_original_parts(full_text, new_images, new_audio)
             all_parts.extend(new_parts)
             pending.original_parts = all_parts
 
             result = await gemini_processor.extract_financial_data(
-                text=full_text,
-                images=new_images,
-                audio=new_audio,
+                text=full_text, images=new_images, audio=new_audio,
             )
         else:
-            # Text-only follow-up — use the conversation-aware re-extraction
             result = await gemini_processor.process_followup(
                 original_parts=pending.original_parts,
                 previous_result=pending.result,
                 user_reply=message.content.strip(),
             )
 
-        # Update pending entry
         pending.result = result
-        pending.status = (
-            "pending_confirmation"
-            if result.confidence >= CONFIDENCE_THRESHOLD and not result.clarifying_questions
-            else "pending_clarification"
+
+        is_confident = (
+            result.confidence >= CONFIDENCE_THRESHOLD
+            and not result.clarifying_questions
+            and len(result.entries) > 0
         )
 
-        response_text = format_extraction_message(result)
-        await message.remove_reaction("\u23f3", bot.user)
-        await message.channel.send(response_text)
+        await message.remove_reaction(EMOJI_PROCESSING, bot.user)
+
+        if is_confident:
+            # After clarification the data is now good — auto-save
+            count = await write_entries_to_sheet(pending)
+
+            response_text = format_extraction_message(result, saved=True)
+            await message.channel.send(response_text)
+
+            try:
+                original_msg = message.channel.starter_message
+                if original_msg:
+                    await set_reaction(original_msg, EMOJI_DONE)
+            except Exception:
+                logger.exception("Could not update original message reaction")
+
+            await sheets_manager.log_conversation(
+                user_input=pending.original_text or "(attachment)",
+                bot_response=response_text[:500],
+                outcome="corrected",
+                discord_link=pending.original_message_url,
+            )
+
+            del pending_entries[thread_id]
+        else:
+            # Still not confident — ask again
+            response_text = format_extraction_message(result, saved=False)
+            await message.channel.send(response_text)
 
     except Exception:
         logger.exception("Error processing thread reply")
-        await message.remove_reaction("\u23f3", bot.user)
+        try:
+            await message.remove_reaction(EMOJI_PROCESSING, bot.user)
+        except Exception:
+            pass
         await message.channel.send(
             "Sorry, something went wrong. Please try again or rephrase your correction."
+        )
+
+        await sheets_manager.log_conversation(
+            user_input=pending.original_text or "(attachment)",
+            bot_response="Error during processing",
+            outcome="error",
+            discord_link=pending.original_message_url,
         )
 
 
@@ -409,8 +484,8 @@ async def help_command(ctx: commands.Context):
         "• A photo of a receipt or invoice\n"
         "• A text description of income or an expense\n"
         "• A voice message describing the transaction\n\n"
-        "The bot will extract the financial data and ask you to confirm "
-        "before adding it to the spreadsheet.\n\n"
+        "If the bot is confident, it saves directly to the spreadsheet.\n"
+        "If something is unclear, it asks you to clarify in a thread.\n\n"
         "**Commands:**\n"
         "`!summary` — Show this month's income & expense summary\n"
         "`!summary MM YYYY` — Show summary for a specific month (e.g. `!summary 01 2026`)\n"
@@ -430,9 +505,9 @@ async def summary_command(ctx: commands.Context, month: int = 0, year: int = 0):
         year = now.year
 
     try:
-        await ctx.message.add_reaction("\u23f3")
+        await ctx.message.add_reaction(EMOJI_PROCESSING)
         data = await sheets_manager.get_monthly_summary(month, year)
-        await ctx.message.remove_reaction("\u23f3", bot.user)
+        await ctx.message.remove_reaction(EMOJI_PROCESSING, bot.user)
 
         month_name = datetime(year, month, 1).strftime("%B %Y")
         lines = [f"**Summary for {month_name}:**\n"]
@@ -467,15 +542,15 @@ async def summary_command(ctx: commands.Context, month: int = 0, year: int = 0):
 async def undo_command(ctx: commands.Context):
     """Remove the last entry from the spreadsheet."""
     try:
-        await ctx.message.add_reaction("\u23f3")
+        await ctx.message.add_reaction(EMOJI_PROCESSING)
         deleted = await sheets_manager.delete_last_entry()
-        await ctx.message.remove_reaction("\u23f3", bot.user)
+        await ctx.message.remove_reaction(EMOJI_PROCESSING, bot.user)
 
         if deleted:
             await ctx.send(
                 f"Removed the last entry:\n"
                 f"• {deleted.get('Date', '?')} | {deleted.get('Type', '?')} | "
-                f"{deleted.get('Category', '?')} | ${deleted.get('Amount', '?')} | "
+                f"{deleted.get('Category', '?')} | ${deleted.get('Amount ($)', '?')} | "
                 f"{deleted.get('Description', '?')}"
             )
         else:
@@ -492,21 +567,13 @@ async def categories_command(ctx: commands.Context):
     await ctx.send(
         "**Available Categories:**\n\n"
         "**Income:**\n"
-        "• Student Payment\n"
-        "• Performance Fee\n"
-        "• Workshop\n"
-        "• Royalties\n"
-        "• Other Income\n\n"
+        "• Teaching\n"
+        "• Performance\n\n"
         "**Expenses:**\n"
-        "• Sheet Music\n"
-        "• Instruments\n"
-        "• Travel\n"
-        "• Studio Rent\n"
-        "• Software/Subscriptions\n"
-        "• Professional Development\n"
-        "• Marketing\n"
-        "• Other Expense\n\n"
-        "*The bot will auto-categorize entries, but you can correct them during confirmation.*"
+        "• IT\n"
+        "• Performance\n"
+        "• Teaching\n\n"
+        "*The bot will auto-categorize entries. If it's unsure, it will ask you.*"
     )
 
 

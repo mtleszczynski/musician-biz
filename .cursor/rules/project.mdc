@@ -9,13 +9,25 @@ alwaysApply: true
 ## Project Overview
 Discord bot for a musician/music teacher to track income & expenses via photos, text,
 and audio messages. Uses Gemini 3 Flash for data extraction, Google Sheets for storage.
+High-confidence entries are auto-saved; low-confidence entries prompt for clarification.
 
 ## Architecture Awareness
-- `main.py` — Discord bot, event handlers, commands. This is the entry point.
+- `main.py` — Discord bot, event handlers, auto-confirm flow, commands. Entry point.
 - `gemini_processor.py` — Gemini API calls. Uses `google-genai` SDK (NOT `google-generativeai`).
-- `sheets_manager.py` — Google Sheets via `gspread`. Sync library wrapped in `asyncio.to_thread()`.
+- `sheets_manager.py` — Google Sheets via `gspread`. Two tabs: "Entries" + "Conversation Log".
+  Sync library wrapped in `asyncio.to_thread()`.
 - `prompts.py` — System prompts AND Pydantic response models. These are tightly coupled.
-- `config.py` — Env var loading. Keep this minimal.
+- `config.py` — Env var loading. Handles full Sheet URLs automatically.
+
+## Spreadsheet Schema
+Entries tab columns: Date, Type, Category, Client/Event, Vendor, Mode of Payment,
+Amount ($), Description, Notes, Discord Link, Timestamp.
+
+Categories:
+- Income: Teaching, Performance
+- Expense: IT, Performance, Teaching
+
+Client/Event and Mode of Payment are income-only. Vendor is expense-only.
 
 ## Coding Conventions
 - Python 3.11+ with type hints on all functions.
@@ -32,13 +44,19 @@ and audio messages. Uses Gemini 3 Flash for data extraction, Google Sheets for s
   Use `response_schema=PydanticModel` for structured JSON output.
 - `gspread` — Google Sheets. Synchronous — always wrap in `asyncio.to_thread()`.
 
+## Emoji Reactions
+- Hourglass: processing
+- Green checkmark: saved to sheet
+- Speech bubble: waiting for user clarification
+- Red X: actual error only (never for "needs input")
+
 ## Important Reminders
 - When changing the Pydantic models in `prompts.py`, also update the system prompt text
   to match (they must stay in sync about categories, field meanings, etc.).
 - When changing the Google Sheet columns, update BOTH `sheets_manager.HEADERS` and
   `sheets_manager.append_entry()`.
 - After any architectural change, UPDATE `AGENTS.md` in the project root.
-- Discord voice messages use the IS_VOICE_MESSAGE flag (bit 13). Handle them in
-  `download_attachments()`.
+- Confidence is based on structured fields only (Date through Amount).
+  Description and Notes are best-effort and never lower confidence.
 - The bot uses in-memory `pending_entries` dict — entries are lost on restart.
   This is acceptable for an MVP but should be noted.

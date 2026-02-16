@@ -19,14 +19,26 @@ HEADERS = [
     "Date",
     "Type",
     "Category",
-    "Amount",
+    "Client/Event",
+    "Vendor",
+    "Mode of Payment",
+    "Amount ($)",
     "Description",
-    "Student",
-    "Payment Method",
+    "Notes",
     "Discord Link",
-    "Raw Summary",
     "Timestamp",
 ]
+
+LOG_HEADERS = [
+    "Timestamp",
+    "User Input",
+    "Bot Response",
+    "Outcome",
+    "Discord Link",
+]
+
+ENTRIES_TAB = "Entries"
+LOG_TAB = "Conversation Log"
 
 
 def _get_credentials() -> Credentials:
@@ -38,79 +50,104 @@ def _get_credentials() -> Credentials:
             "Set it to a file path or a JSON string of your service account credentials."
         )
 
-    # Try parsing as JSON string first (for Railway / cloud deployments)
     if creds_value.strip().startswith("{"):
         info = json.loads(creds_value)
         return Credentials.from_service_account_info(info, scopes=SCOPES)
 
-    # Fall back to treating it as a file path
     return Credentials.from_service_account_file(creds_value, scopes=SCOPES)
 
 
-def _get_worksheet() -> gspread.Worksheet:
-    """Authorize and return the first worksheet of the configured spreadsheet."""
+def _get_spreadsheet() -> gspread.Spreadsheet:
+    """Authorize and return the configured spreadsheet."""
     creds = _get_credentials()
     gc = gspread.authorize(creds)
-    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
-    worksheet = spreadsheet.sheet1
-    _ensure_headers(worksheet)
+    return gc.open_by_key(SPREADSHEET_ID)
+
+
+def _get_or_create_worksheet(
+    spreadsheet: gspread.Spreadsheet,
+    title: str,
+    headers: list[str],
+) -> gspread.Worksheet:
+    """Get a worksheet by title, or create it with headers if it doesn't exist."""
+    try:
+        worksheet = spreadsheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title=title, rows=1000, cols=len(headers))
+        worksheet.append_row(headers, value_input_option="USER_ENTERED")
+        logger.info("Created worksheet '%s' with headers", title)
+        return worksheet
+
+    first_row = worksheet.row_values(1)
+    if not first_row or first_row[0] != headers[0]:
+        worksheet.insert_row(headers, index=1)
+        logger.info("Added header row to worksheet '%s'", title)
+
     return worksheet
 
 
-def _ensure_headers(worksheet: gspread.Worksheet) -> None:
-    """Add header row if the sheet is empty."""
-    first_row = worksheet.row_values(1)
-    if not first_row or first_row[0] != HEADERS[0]:
-        worksheet.insert_row(HEADERS, index=1)
-        logger.info("Created header row in spreadsheet")
+def _get_entries_worksheet() -> gspread.Worksheet:
+    """Return the Entries worksheet, creating it if needed."""
+    spreadsheet = _get_spreadsheet()
 
+    # Rename the default "Sheet1" to "Entries" if that's what exists
+    try:
+        sheet1 = spreadsheet.worksheet("Sheet1")
+        sheet1.update_title(ENTRIES_TAB)
+        logger.info("Renamed 'Sheet1' to '%s'", ENTRIES_TAB)
+    except gspread.WorksheetNotFound:
+        pass
+
+    return _get_or_create_worksheet(spreadsheet, ENTRIES_TAB, HEADERS)
+
+
+def _get_log_worksheet() -> gspread.Worksheet:
+    """Return the Conversation Log worksheet, creating it if needed."""
+    spreadsheet = _get_spreadsheet()
+    return _get_or_create_worksheet(spreadsheet, LOG_TAB, LOG_HEADERS)
+
+
+# ---------------------------------------------------------------------------
+# Entries tab operations
+# ---------------------------------------------------------------------------
 
 def _append_row_sync(row: list[str]) -> int:
-    """Append a single row to the sheet. Returns the row number."""
-    worksheet = _get_worksheet()
+    """Append a single row to the Entries sheet. Returns the row number."""
+    worksheet = _get_entries_worksheet()
     result = worksheet.append_row(row, value_input_option="USER_ENTERED")
     updated_range = result.get("updates", {}).get("updatedRange", "")
-    # Extract row number from range like 'Sheet1!A5:J5'
     try:
         row_num = int(updated_range.split("!")[1].split(":")[0][1:])
     except (IndexError, ValueError):
         row_num = len(worksheet.get_all_values())
-    logger.info("Appended row %d to spreadsheet", row_num)
+    logger.info("Appended row %d to Entries sheet", row_num)
     return row_num
 
 
 def _delete_last_row_sync() -> dict | None:
-    """Delete the last data row from the sheet. Returns the deleted row data or None."""
-    worksheet = _get_worksheet()
+    """Delete the last data row from the Entries sheet."""
+    worksheet = _get_entries_worksheet()
     all_values = worksheet.get_all_values()
     if len(all_values) <= 1:
-        return None  # Only header row or empty
+        return None
 
     last_row = all_values[-1]
     worksheet.delete_rows(len(all_values))
-    logger.info("Deleted last row (row %d) from spreadsheet", len(all_values))
+    logger.info("Deleted last row (row %d) from Entries sheet", len(all_values))
     return {HEADERS[i]: last_row[i] for i in range(min(len(HEADERS), len(last_row)))}
 
 
 def _get_monthly_summary_sync(month: int, year: int) -> dict:
-    """Get income/expense totals by category for a given month.
-
-    Returns:
-        {
-            "income": {"Student Payment": 500.0, ...},
-            "expenses": {"Sheet Music": 45.99, ...},
-            "total_income": 500.0,
-            "total_expenses": 45.99,
-        }
-    """
-    worksheet = _get_worksheet()
+    """Get income/expense totals by category for a given month."""
+    worksheet = _get_entries_worksheet()
     all_values = worksheet.get_all_values()
 
     income: dict[str, float] = {}
     expenses: dict[str, float] = {}
 
-    for row in all_values[1:]:  # Skip header
-        if len(row) < 5:
+    # Amount is column index 6 ("Amount ($)")
+    for row in all_values[1:]:
+        if len(row) < 7:
             continue
         try:
             row_date = datetime.strptime(row[0], "%Y-%m-%d")
@@ -123,7 +160,7 @@ def _get_monthly_summary_sync(month: int, year: int) -> dict:
         entry_type = row[1].lower()
         category = row[2]
         try:
-            amount = float(row[3].replace("$", "").replace(",", ""))
+            amount = float(row[6].replace("$", "").replace(",", ""))
         except ValueError:
             continue
 
@@ -140,31 +177,57 @@ def _get_monthly_summary_sync(month: int, year: int) -> dict:
     }
 
 
-# --- Async wrappers (gspread is synchronous) ---
+# ---------------------------------------------------------------------------
+# Conversation Log tab operations
+# ---------------------------------------------------------------------------
 
+def _log_conversation_sync(
+    user_input: str,
+    bot_response: str,
+    outcome: str,
+    discord_link: str,
+) -> None:
+    """Append a row to the Conversation Log tab."""
+    worksheet = _get_log_worksheet()
+    row = [
+        datetime.now().isoformat(),
+        user_input[:500],  # Truncate long inputs
+        bot_response[:500],
+        outcome,
+        discord_link,
+    ]
+    worksheet.append_row(row, value_input_option="USER_ENTERED")
+    logger.info("Logged conversation (outcome=%s)", outcome)
+
+
+# ---------------------------------------------------------------------------
+# Async wrappers (gspread is synchronous)
+# ---------------------------------------------------------------------------
 
 async def append_entry(
     date: str,
     entry_type: str,
     category: str,
     amount: float,
-    description: str,
     discord_link: str,
-    raw_summary: str,
-    student: str | None = None,
-    payment_method: str | None = None,
+    client_or_event: str | None = None,
+    vendor: str | None = None,
+    mode_of_payment: str | None = None,
+    description: str = "",
+    notes: str = "",
 ) -> int:
     """Append a financial entry to the Google Sheet. Returns the row number."""
     row = [
         date,
         entry_type.capitalize(),
         category,
+        client_or_event or "",
+        vendor or "",
+        mode_of_payment or "",
         f"{amount:.2f}",
         description,
-        student or "",
-        payment_method or "",
+        notes,
         discord_link,
-        raw_summary,
         datetime.now().isoformat(),
     ]
     return await asyncio.to_thread(_append_row_sync, row)
@@ -178,3 +241,15 @@ async def delete_last_entry() -> dict | None:
 async def get_monthly_summary(month: int, year: int) -> dict:
     """Get monthly income/expense summary by category."""
     return await asyncio.to_thread(_get_monthly_summary_sync, month, year)
+
+
+async def log_conversation(
+    user_input: str,
+    bot_response: str,
+    outcome: str,
+    discord_link: str,
+) -> None:
+    """Log a conversation to the Conversation Log tab."""
+    await asyncio.to_thread(
+        _log_conversation_sync, user_input, bot_response, outcome, discord_link
+    )
