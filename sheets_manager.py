@@ -137,6 +137,37 @@ def _delete_last_row_sync() -> dict | None:
     return {HEADERS[i]: last_row[i] for i in range(min(len(HEADERS), len(last_row)))}
 
 
+def _delete_rows_sync(row_numbers: list[int]) -> int:
+    """Delete specific rows from the Entries sheet. Returns count deleted.
+
+    Rows are deleted in reverse order to preserve row numbers.
+    """
+    if not row_numbers:
+        return 0
+    worksheet = _get_entries_worksheet()
+    count = 0
+    for row_num in sorted(row_numbers, reverse=True):
+        try:
+            worksheet.delete_rows(row_num)
+            count += 1
+            logger.info("Deleted row %d from Entries sheet", row_num)
+        except Exception:
+            logger.exception("Failed to delete row %d", row_num)
+    return count
+
+
+def _find_rows_by_discord_link_sync(discord_link: str) -> list[int]:
+    """Find all row numbers in the Entries sheet that match a Discord link."""
+    worksheet = _get_entries_worksheet()
+    all_values = worksheet.get_all_values()
+    discord_link_col = HEADERS.index("Discord Link")
+    row_numbers = []
+    for i, row in enumerate(all_values[1:], start=2):  # skip header, 1-indexed
+        if len(row) > discord_link_col and row[discord_link_col] == discord_link:
+            row_numbers.append(i)
+    return row_numbers
+
+
 def _get_monthly_summary_sync(month: int, year: int) -> dict:
     """Get income/expense totals by category for a given month."""
     worksheet = _get_entries_worksheet()
@@ -231,6 +262,16 @@ async def append_entry(
         datetime.now().isoformat(),
     ]
     return await asyncio.to_thread(_append_row_sync, row)
+
+
+async def find_rows_by_discord_link(discord_link: str) -> list[int]:
+    """Find all row numbers matching a Discord link."""
+    return await asyncio.to_thread(_find_rows_by_discord_link_sync, discord_link)
+
+
+async def delete_rows(row_numbers: list[int]) -> int:
+    """Delete specific rows from the Entries sheet. Returns count deleted."""
+    return await asyncio.to_thread(_delete_rows_sync, row_numbers)
 
 
 async def delete_last_entry() -> dict | None:

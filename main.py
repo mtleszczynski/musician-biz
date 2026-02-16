@@ -42,7 +42,8 @@ class PendingEntry:
     original_parts: list[types.Part] = field(default_factory=list)
     original_message_url: str = ""
     original_text: str = ""
-    status: str = "pending"  # "pending_clarification"
+    status: str = "pending"  # "pending_clarification" | "saved"
+    saved_row_numbers: list[int] = field(default_factory=list)
 
 
 # thread_id -> PendingEntry
@@ -121,7 +122,9 @@ def format_extraction_message(result: ExtractionResult, saved: bool = False) -> 
         for q in result.clarifying_questions:
             msg += f"• {q}\n"
         msg += "\nPlease answer the questions above, or tell me what to fix."
-    elif not saved:
+    elif saved:
+        msg += "\n\n_Reply here if anything needs to be corrected._"
+    else:
         msg += "\n\nReply **yes** to confirm, or tell me what needs to be corrected."
 
     return msg
@@ -175,11 +178,11 @@ def build_original_parts(
     return parts
 
 
-async def write_entries_to_sheet(pending: PendingEntry) -> int:
-    """Write all entries from a PendingEntry to Google Sheets. Returns count written."""
-    count = 0
+async def write_entries_to_sheet(pending: PendingEntry) -> list[int]:
+    """Write all entries from a PendingEntry to Google Sheets. Returns row numbers written."""
+    row_numbers: list[int] = []
     for entry in pending.result.entries:
-        await sheets_manager.append_entry(
+        row_num = await sheets_manager.append_entry(
             date=entry.date,
             entry_type=entry.type,
             category=entry.category,
@@ -191,8 +194,8 @@ async def write_entries_to_sheet(pending: PendingEntry) -> int:
             description=entry.description,
             notes=entry.notes,
         )
-        count += 1
-    return count
+        row_numbers.append(row_num)
+    return row_numbers
 
 
 async def set_reaction(message: discord.Message, emoji: str) -> None:
@@ -207,6 +210,59 @@ async def set_reaction(message: discord.Message, emoji: str) -> None:
         await message.add_reaction(emoji)
     except Exception:
         logger.exception("Failed to set reaction %s", emoji)
+
+
+# ---------------------------------------------------------------------------
+# Thread reconstruction (for threads lost after bot restart)
+# ---------------------------------------------------------------------------
+
+async def reconstruct_pending_entry(thread: discord.Thread) -> PendingEntry | None:
+    """Rebuild a PendingEntry from an untracked thread's history.
+
+    This handles the case where the bot restarted and lost in-memory state,
+    but the user still wants to correct an entry in an existing thread.
+    """
+    try:
+        # Get the starter message (the original expense message)
+        starter = thread.starter_message
+        if not starter:
+            # Starter message might not be cached; fetch from the parent channel
+            starter = await thread.parent.fetch_message(thread.id)
+
+        # Re-download original attachments
+        images, audio = await download_attachments(starter)
+        text = starter.content.strip() if starter.content else None
+
+        if not text and not images and not audio:
+            return None
+
+        # Re-extract from original content
+        result = await gemini_processor.extract_financial_data(
+            text=text, images=images, audio=audio
+        )
+        original_parts = build_original_parts(text, images, audio)
+
+        # Look up saved rows by discord link
+        saved_rows = await sheets_manager.find_rows_by_discord_link(starter.jump_url)
+
+        logger.info(
+            "Reconstructed pending entry for thread %d (found %d saved rows)",
+            thread.id,
+            len(saved_rows),
+        )
+
+        return PendingEntry(
+            result=result,
+            original_parts=original_parts,
+            original_message_url=starter.jump_url,
+            original_text=text or "",
+            status="saved" if saved_rows else "pending_clarification",
+            saved_row_numbers=saved_rows,
+        )
+
+    except Exception:
+        logger.exception("Failed to reconstruct pending entry for thread %d", thread.id)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +300,15 @@ async def on_message(message: discord.Message):
     # Follow-up in a tracked thread
     elif isinstance(message.channel, discord.Thread) and message.channel.id in pending_entries:
         await handle_thread_reply(message)
+
+    # Follow-up in an untracked thread (bot restarted, lost in-memory state)
+    elif (
+        isinstance(message.channel, discord.Thread)
+        and message.channel.parent_id
+        and str(message.channel.parent_id) == str(CHANNEL_ID)
+        and message.channel.id not in pending_entries
+    ):
+        await handle_untracked_thread_reply(message)
 
 
 async def handle_new_entry(message: discord.Message):
@@ -283,8 +348,13 @@ async def handle_new_entry(message: discord.Message):
                 original_parts=original_parts,
                 original_message_url=message.jump_url,
                 original_text=text or "",
+                status="saved",
             )
-            count = await write_entries_to_sheet(pending)
+            row_numbers = await write_entries_to_sheet(pending)
+            pending.saved_row_numbers = row_numbers
+
+            # Keep thread tracked so user can send corrections
+            pending_entries[thread.id] = pending
 
             response_text = format_extraction_message(result, saved=True)
             await thread.send(response_text)
@@ -297,7 +367,7 @@ async def handle_new_entry(message: discord.Message):
                 outcome="auto-confirmed",
                 discord_link=message.jump_url,
             )
-            logger.info("Auto-confirmed %d entries", count)
+            logger.info("Auto-confirmed %d entries (rows %s)", len(row_numbers), row_numbers)
 
         else:
             # --- NEEDS CLARIFICATION: ask the user ---
@@ -333,23 +403,27 @@ async def handle_thread_reply(message: discord.Message):
     try:
         user_text = message.content.strip().lower()
 
-        # Check if user is confirming
-        if user_text in CONFIRM_WORDS and len(pending.result.entries) > 0:
+        # If entry isn't saved yet, check if user is confirming
+        if (
+            pending.status != "saved"
+            and user_text in CONFIRM_WORDS
+            and len(pending.result.entries) > 0
+        ):
             await message.add_reaction(EMOJI_PROCESSING)
 
-            count = await write_entries_to_sheet(pending)
+            row_numbers = await write_entries_to_sheet(pending)
+            pending.saved_row_numbers = row_numbers
+            pending.status = "saved"
 
-            await message.remove_reaction(EMOJI_PROCESSING, bot.user)
+            await set_reaction(message, EMOJI_DONE)
             response_text = format_extraction_message(pending.result, saved=True)
             await message.channel.send(response_text)
 
             # Update reaction on original message
             try:
-                original_channel = bot.get_channel(int(CHANNEL_ID))
-                if original_channel:
-                    original_msg = message.channel.starter_message
-                    if original_msg:
-                        await set_reaction(original_msg, EMOJI_DONE)
+                original_msg = message.channel.starter_message
+                if original_msg:
+                    await set_reaction(original_msg, EMOJI_DONE)
             except Exception:
                 logger.exception("Could not update original message reaction")
 
@@ -360,8 +434,6 @@ async def handle_thread_reply(message: discord.Message):
                 outcome="user-confirmed",
                 discord_link=pending.original_message_url,
             )
-
-            del pending_entries[thread_id]
             return
 
         # User is providing corrections or answering questions
@@ -386,6 +458,12 @@ async def handle_thread_reply(message: discord.Message):
                 user_reply=message.content.strip(),
             )
 
+        # If previously saved, delete old rows before writing corrected ones
+        if pending.status == "saved" and pending.saved_row_numbers:
+            deleted = await sheets_manager.delete_rows(pending.saved_row_numbers)
+            logger.info("Deleted %d old rows for correction", deleted)
+            pending.saved_row_numbers = []
+
         pending.result = result
 
         is_confident = (
@@ -394,12 +472,13 @@ async def handle_thread_reply(message: discord.Message):
             and len(result.entries) > 0
         )
 
-        await message.remove_reaction(EMOJI_PROCESSING, bot.user)
-
         if is_confident:
-            # After clarification the data is now good — auto-save
-            count = await write_entries_to_sheet(pending)
+            # Data is good — save (or re-save after correction)
+            row_numbers = await write_entries_to_sheet(pending)
+            pending.saved_row_numbers = row_numbers
+            pending.status = "saved"
 
+            await set_reaction(message, EMOJI_DONE)
             response_text = format_extraction_message(result, saved=True)
             await message.channel.send(response_text)
 
@@ -416,19 +495,24 @@ async def handle_thread_reply(message: discord.Message):
                 outcome="corrected",
                 discord_link=pending.original_message_url,
             )
-
-            del pending_entries[thread_id]
         else:
             # Still not confident — ask again
+            pending.status = "pending_clarification"
+            await set_reaction(message, EMOJI_NEEDS_INPUT)
             response_text = format_extraction_message(result, saved=False)
             await message.channel.send(response_text)
 
+            # Update original message to show it needs input
+            try:
+                original_msg = message.channel.starter_message
+                if original_msg:
+                    await set_reaction(original_msg, EMOJI_NEEDS_INPUT)
+            except Exception:
+                logger.exception("Could not update original message reaction")
+
     except Exception:
         logger.exception("Error processing thread reply")
-        try:
-            await message.remove_reaction(EMOJI_PROCESSING, bot.user)
-        except Exception:
-            pass
+        await set_reaction(message, EMOJI_ERROR)
         await message.channel.send(
             "Sorry, something went wrong. Please try again or rephrase your correction."
         )
@@ -438,6 +522,83 @@ async def handle_thread_reply(message: discord.Message):
             bot_response="Error during processing",
             outcome="error",
             discord_link=pending.original_message_url,
+        )
+
+
+async def handle_untracked_thread_reply(message: discord.Message):
+    """Handle a reply in a thread the bot created but lost track of (e.g. after restart)."""
+    thread = message.channel
+
+    try:
+        await message.add_reaction(EMOJI_PROCESSING)
+
+        # Reconstruct the pending entry from thread history
+        pending = await reconstruct_pending_entry(thread)
+        if not pending:
+            await set_reaction(message, EMOJI_ERROR)
+            await thread.send(
+                "Sorry, I couldn't find the original message for this thread. "
+                "Please create a new entry in the main channel."
+            )
+            return
+
+        # Store it so future replies in this thread are handled normally
+        pending_entries[thread.id] = pending
+
+        # Now process the user's correction through the normal followup flow
+        result = await gemini_processor.process_followup(
+            original_parts=pending.original_parts,
+            previous_result=pending.result,
+            user_reply=message.content.strip(),
+        )
+
+        # If previously saved, delete old rows before writing corrected ones
+        if pending.saved_row_numbers:
+            deleted = await sheets_manager.delete_rows(pending.saved_row_numbers)
+            logger.info("Deleted %d old rows for correction (reconstructed)", deleted)
+            pending.saved_row_numbers = []
+
+        pending.result = result
+
+        is_confident = (
+            result.confidence >= CONFIDENCE_THRESHOLD
+            and not result.clarifying_questions
+            and len(result.entries) > 0
+        )
+
+        if is_confident:
+            row_numbers = await write_entries_to_sheet(pending)
+            pending.saved_row_numbers = row_numbers
+            pending.status = "saved"
+
+            await set_reaction(message, EMOJI_DONE)
+            response_text = format_extraction_message(result, saved=True)
+            await thread.send(response_text)
+
+            try:
+                original_msg = thread.starter_message
+                if original_msg:
+                    await set_reaction(original_msg, EMOJI_DONE)
+            except Exception:
+                logger.exception("Could not update original message reaction")
+
+            await sheets_manager.log_conversation(
+                user_input=pending.original_text or "(attachment)",
+                bot_response=response_text[:500],
+                outcome="corrected-after-restart",
+                discord_link=pending.original_message_url,
+            )
+        else:
+            pending.status = "pending_clarification"
+            await set_reaction(message, EMOJI_NEEDS_INPUT)
+            response_text = format_extraction_message(result, saved=False)
+            await thread.send(response_text)
+
+    except Exception:
+        logger.exception("Error handling untracked thread reply")
+        await set_reaction(message, EMOJI_ERROR)
+        await thread.send(
+            "Sorry, something went wrong. Please try again or rephrase your correction."
         )
 
 
