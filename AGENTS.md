@@ -81,7 +81,7 @@ Discord Channel ──message──▶ main.py (thin dispatcher)
 | `main.py` | Discord event dispatcher. Downloads attachments, manages emoji, creates threads. Thin — all logic delegated to entry_manager. |
 | `entry_manager.py` | Entry lifecycle orchestration. Creates entries, processes corrections, confirms, saves. Coordinates db + gemini + sheets. |
 | `gemini_processor.py` | Gemini API integration. Transcribes audio, describes images, extracts financial data, processes field-level corrections. |
-| `sheets_manager.py` | Google Sheets CRUD. Append, update-in-place, safe-replace. Two tabs: "Entries" + "Conversation Log". Sync gspread wrapped in asyncio.to_thread(). |
+| `sheets_manager.py` | Google Sheets CRUD. Append, update-in-place, safe-replace. Each channel maps to its own tab (e.g. "Entries", "Test Entries"). Sync gspread wrapped in asyncio.to_thread(). |
 | `db.py` | SQLite persistence. Conversations (entry state), media_cache (transcriptions/descriptions), conversation_messages (thread history). |
 | `prompts.py` | System prompts + Pydantic models. FinancialEntry, ExtractionResult (initial), FieldUpdate, FollowupResult (corrections). Tightly coupled with prompts. |
 | `config.py` | Environment variable loading + logging setup. |
@@ -103,21 +103,20 @@ Discord Channel ──message──▶ main.py (thin dispatcher)
 | Discord Link | Link to the Discord thread for this entry |
 | Timestamp | When the row was added |
 
-## Conversation Log ("Conversation Log" tab)
+## Multi-Channel Routing
 
-| Column | Description |
-|--------|-------------|
-| Timestamp | When the conversation occurred |
-| User Input | The original user message (truncated to 500 chars) |
-| Bot Response | What the bot showed/extracted (truncated to 500 chars) |
-| Outcome | auto-confirmed, user-confirmed, corrected, or error |
-| Discord Link | Link to the thread |
+Each Discord channel maps to its own sheet tab via `CHANNEL_TAB_MAP` in `config.py`:
+- `PROD_CHANNEL_ID` -> "Entries" tab (production)
+- `TEST_CHANNEL_ID` -> "Test Entries" tab (testing)
+
+The tab name is stored in the SQLite `conversations` table so that thread replies
+automatically route to the correct tab without needing the channel ID again.
 
 ## SQLite Schema (db.py)
 
 | Table | Purpose |
 |-------|---------|
-| conversations | Entry state: thread_id, entries JSON, confidence, status, sheet row numbers |
+| conversations | Entry state: thread_id, entries JSON, confidence, status, sheet row numbers, tab_name |
 | media_cache | Cached transcriptions (audio) and descriptions (images) by message_id |
 | conversation_messages | Full thread history (role + content) for Gemini context in corrections |
 
@@ -135,7 +134,8 @@ Discord Channel ──message──▶ main.py (thin dispatcher)
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `DISCORD_TOKEN` | Yes | Bot token from Discord Developer Portal |
-| `CHANNEL_ID` | Yes | ID of the Discord channel to monitor |
+| `PROD_CHANNEL_ID` | Yes | Production channel ID -> "Entries" tab |
+| `TEST_CHANNEL_ID` | No | Testing channel ID -> "Test Entries" tab |
 | `GEMINI_API_KEY` | Yes | API key from Google AI Studio |
 | `SPREADSHEET_ID` | Yes | Google Sheet ID (or full URL — auto-extracted) |
 | `GOOGLE_CREDENTIALS_JSON` | Yes | Service account creds (JSON string or file path) |

@@ -16,10 +16,10 @@ entries prompt for clarification. Corrections use field-level updates, not full 
 - `main.py` — Thin Discord event dispatcher. Downloads attachments, manages emoji, creates threads. Delegates all logic to entry_manager.
 - `entry_manager.py` — Entry lifecycle orchestration. Creates entries, processes corrections, confirms, saves. The central coordination layer.
 - `gemini_processor.py` — Gemini API calls. Uses `google-genai` SDK (NOT `google-generativeai`). Transcribes audio, describes images, extracts data, processes field-level corrections.
-- `sheets_manager.py` — Google Sheets via `gspread`. Two tabs: "Entries" + "Conversation Log". Supports append, update-in-place, and safe-replace. Sync library wrapped in `asyncio.to_thread()`.
-- `db.py` — SQLite via `aiosqlite`. Three tables: conversations (entry state), media_cache (transcriptions/descriptions), conversation_messages (thread history).
+- `sheets_manager.py` — Google Sheets via `gspread`. Each channel maps to its own tab (e.g. "Entries", "Test Entries"). Supports append, update-in-place, and safe-replace. All functions accept `tab_name` parameter. Sync library wrapped in `asyncio.to_thread()`.
+- `db.py` — SQLite via `aiosqlite`. Three tables: conversations (entry state + tab_name), media_cache (transcriptions/descriptions), conversation_messages (thread history).
 - `prompts.py` — System prompts AND Pydantic response models. Models: FinancialEntry, ExtractionResult (initial extraction), FieldUpdate, FollowupResult (corrections). Tightly coupled with prompt text.
-- `config.py` — Env var loading + `setup_logging()`. Handles full Sheet URLs automatically.
+- `config.py` — Env var loading + `setup_logging()`. Handles full Sheet URLs automatically. Builds `CHANNEL_TAB_MAP` from `PROD_CHANNEL_ID` and `TEST_CHANNEL_ID`.
 
 ## Spreadsheet Schema
 Entries tab columns: Date, Type, Category, Client/Event, Vendor, Mode of Payment,

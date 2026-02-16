@@ -11,7 +11,21 @@ load_dotenv()
 # Discord
 # ---------------------------------------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+
+PROD_CHANNEL_ID = os.getenv("PROD_CHANNEL_ID")
+TEST_CHANNEL_ID = os.getenv("TEST_CHANNEL_ID")
+
+# Channel ID -> sheet tab name mapping
+CHANNEL_TAB_MAP: dict[str, str] = {}
+if PROD_CHANNEL_ID:
+    CHANNEL_TAB_MAP[str(PROD_CHANNEL_ID)] = "Entries"
+if TEST_CHANNEL_ID:
+    CHANNEL_TAB_MAP[str(TEST_CHANNEL_ID)] = "Test Entries"
+
+
+def get_tab_for_channel(channel_id: int | str) -> str | None:
+    """Look up the sheet tab name for a given Discord channel ID."""
+    return CHANNEL_TAB_MAP.get(str(channel_id))
 
 # ---------------------------------------------------------------------------
 # Gemini

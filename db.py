@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     questions_json  TEXT NOT NULL DEFAULT '[]',
     raw_summary     TEXT NOT NULL DEFAULT '',
     sheet_rows_json TEXT NOT NULL DEFAULT '[]',
+    tab_name        TEXT NOT NULL DEFAULT 'Entries',
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -71,6 +72,15 @@ async def init_db() -> None:
     """Create tables if they don't exist. Call once at startup."""
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.executescript(_SCHEMA)
+        # Migration: add tab_name column if upgrading from older schema
+        try:
+            await conn.execute(
+                "ALTER TABLE conversations ADD COLUMN tab_name TEXT NOT NULL DEFAULT 'Entries'"
+            )
+            await conn.commit()
+            logger.info("op=init_db | Migrated: added tab_name column")
+        except Exception:
+            pass  # Column already exists
         await conn.commit()
     logger.info("op=init_db | Database initialised at %s", DB_PATH)
 
@@ -87,6 +97,7 @@ async def create_conversation(
     confidence: float,
     questions: list[str],
     raw_summary: str,
+    tab_name: str = "Entries",
 ) -> int:
     """Insert a new conversation row. Returns the conversation id."""
     now = _now()
@@ -96,8 +107,8 @@ async def create_conversation(
             INSERT INTO conversations
                 (thread_id, message_url, original_text, status,
                  entries_json, confidence, questions_json, raw_summary,
-                 created_at, updated_at)
-            VALUES (?, ?, ?, 'pending_clarification', ?, ?, ?, ?, ?, ?)
+                 tab_name, created_at, updated_at)
+            VALUES (?, ?, ?, 'pending_clarification', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 thread_id,
@@ -107,13 +118,14 @@ async def create_conversation(
                 confidence,
                 json.dumps(questions),
                 raw_summary,
+                tab_name,
                 now,
                 now,
             ),
         )
         await conn.commit()
         row_id = cursor.lastrowid
-    logger.info("thread=%d op=create_conversation | id=%d", thread_id, row_id)
+    logger.info("thread=%d op=create_conversation | id=%d, tab=%s", thread_id, row_id, tab_name)
     return row_id
 
 

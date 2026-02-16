@@ -2,6 +2,7 @@
 and field-level corrections.
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -9,6 +10,7 @@ from datetime import date
 
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError, ServerError
 
 from config import GEMINI_API_KEY, GEMINI_MODEL
 from prompts import (
@@ -22,12 +24,35 @@ from prompts import (
 
 logger = logging.getLogger(__name__)
 
+# Retry config for transient Gemini errors (503 overload, 429 rate limit)
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 2.0  # seconds, doubled on each retry
+
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 def _build_date_context() -> str:
     """Return a short string telling the model today's date."""
     return f"Today's date is {date.today().isoformat()}."
+
+
+async def _generate_with_retry(**kwargs) -> types.GenerateContentResponse:
+    """Call Gemini's generate_content with retry for transient errors (503, 429)."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return await client.aio.models.generate_content(**kwargs)
+        except (ServerError, APIError) as exc:
+            status = getattr(exc, "status", None) or getattr(exc, "code", 0)
+            retryable = isinstance(exc, ServerError) or status in (429, 503)
+            if not retryable or attempt == MAX_RETRIES - 1:
+                raise
+            delay = RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                "op=gemini_retry | Attempt %d/%d failed (%s), retrying in %.1fs",
+                attempt + 1, MAX_RETRIES, exc, delay,
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError("Unreachable")
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +72,7 @@ async def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str:
         types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
     ]
 
-    response = await client.aio.models.generate_content(
+    response = await _generate_with_retry(
         model=GEMINI_MODEL,
         contents=parts,
         config=types.GenerateContentConfig(temperature=0.1),
@@ -80,7 +105,7 @@ async def describe_image(image_bytes: bytes, mime_type: str) -> str:
         types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
     ]
 
-    response = await client.aio.models.generate_content(
+    response = await _generate_with_retry(
         model=GEMINI_MODEL,
         contents=parts,
         config=types.GenerateContentConfig(temperature=0.1),
@@ -147,7 +172,7 @@ async def extract_financial_data(
 
     logger.info("op=extract | Sending %d part(s) to Gemini", len(parts))
 
-    response = await client.aio.models.generate_content(
+    response = await _generate_with_retry(
         model=GEMINI_MODEL,
         contents=parts,
         config=types.GenerateContentConfig(
@@ -228,7 +253,7 @@ async def process_correction(
 
     logger.info("op=correction | Sending %d turns to Gemini", len(contents))
 
-    response = await client.aio.models.generate_content(
+    response = await _generate_with_retry(
         model=GEMINI_MODEL,
         contents=contents,
         config=types.GenerateContentConfig(

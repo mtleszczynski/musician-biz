@@ -8,6 +8,7 @@ sheets_manager.py (Google Sheets). main.py delegates all logic here.
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 
 import db
 import gemini_processor
@@ -148,6 +149,209 @@ def _format_correction_message(
 
 
 # ---------------------------------------------------------------------------
+# Duplicate detection
+# ---------------------------------------------------------------------------
+
+SKIP_WORDS = frozenset({
+    "skip", "no", "discard", "don't save", "duplicate", "already added",
+    "don't add", "nope",
+})
+
+
+def _find_duplicates(
+    new_entries: list[dict],
+    recent_entries: list[dict],
+) -> list[tuple[int, dict]]:
+    """Compare new entries against recent sheet entries for potential duplicates.
+
+    Returns list of (new_entry_index, matching_existing_entry) pairs.
+    Match criteria: same amount (within $0.01) AND same date (within 1 day) AND
+    at least one of: same client/event, same vendor, or same category+type.
+    """
+    matches: list[tuple[int, dict]] = []
+
+    for i, new_entry in enumerate(new_entries):
+        new_amount = new_entry.get("amount", 0)
+        if isinstance(new_amount, str):
+            try:
+                new_amount = float(str(new_amount).replace("$", "").replace(",", ""))
+            except ValueError:
+                new_amount = 0.0
+
+        try:
+            new_date = datetime.strptime(new_entry.get("date", ""), "%Y-%m-%d")
+        except ValueError:
+            new_date = None
+
+        new_client = (new_entry.get("client_or_event") or "").strip().lower()
+        new_vendor = (new_entry.get("vendor") or "").strip().lower()
+        new_type = (new_entry.get("type") or "").strip().lower()
+        new_category = (new_entry.get("category") or "").strip().lower()
+
+        for existing in recent_entries:
+            # Amount must match within $0.01
+            if abs(new_amount - existing["amount"]) > 0.01:
+                continue
+
+            # Date must be within 1 day
+            if new_date is not None:
+                try:
+                    existing_date = datetime.strptime(existing["date"], "%Y-%m-%d")
+                except ValueError:
+                    continue
+                if abs((new_date - existing_date).days) > 1:
+                    continue
+            else:
+                continue
+
+            # At least one contextual field must match
+            existing_client = (existing.get("client_or_event") or "").strip().lower()
+            existing_vendor = (existing.get("vendor") or "").strip().lower()
+            existing_type = (existing.get("type") or "").strip().lower()
+            existing_category = (existing.get("category") or "").strip().lower()
+
+            client_match = (
+                new_client and existing_client
+                and (new_client in existing_client or existing_client in new_client)
+            )
+            vendor_match = (
+                new_vendor and existing_vendor
+                and (new_vendor in existing_vendor or existing_vendor in new_vendor)
+            )
+            type_category_match = (
+                new_type == existing_type and new_category == existing_category
+            )
+
+            if client_match or vendor_match or type_category_match:
+                matches.append((i, existing))
+                break  # One match per new entry is enough
+
+    return matches
+
+
+def _format_duplicate_warning(
+    entries: list[dict],
+    duplicates: list[tuple[int, dict]],
+) -> str:
+    """Build a Discord warning message about potential duplicate entries."""
+    lines: list[str] = []
+
+    # Show the extracted entries first
+    count = len(entries)
+    lines.append(f"**Here's what I found ({count} {'entry' if count == 1 else 'entries'}):**\n")
+    for i, entry in enumerate(entries, start=1):
+        label = i if count > 1 else None
+        lines.append(_format_entry(entry, label))
+
+    # Show duplicate warnings
+    lines.append("\n\n:warning: **Possible duplicate detected!**\n")
+    lines.append("This looks similar to existing entries:\n")
+
+    for new_idx, existing in duplicates:
+        entry_label = f"Entry {new_idx + 1}" if count > 1 else "This entry"
+        existing_amount = existing['amount']
+        existing_desc = existing.get('description', '')
+        existing_client = existing.get('client_or_event', '')
+        existing_vendor = existing.get('vendor', '')
+        who = existing_client or existing_vendor or ""
+
+        detail = f"{existing['date']} | {existing.get('category', '?')}"
+        if who:
+            detail += f" | {who}"
+        detail += f" | ${existing_amount:,.2f}"
+        if existing_desc:
+            detail += f" | {existing_desc}"
+
+        lines.append(f"• **{entry_label}** matches: {detail}")
+        if existing.get("discord_link"):
+            lines.append(f"  Thread: {existing['discord_link']}")
+
+    lines.append("\nReply **yes** to save anyway, or **skip** to discard.")
+
+    return "\n".join(lines)
+
+
+def _format_duplicate_hold_message(
+    entries: list[dict],
+    duplicates: list[tuple[int, dict]],
+) -> str:
+    """Warning when all entries are duplicates at save time (entries already shown)."""
+    lines = [":warning: **Hold on — these entries appear to already be in the spreadsheet:**\n"]
+
+    for new_idx, existing in duplicates:
+        entry = entries[new_idx]
+        amount = entry.get("amount", 0)
+        if isinstance(amount, str):
+            try:
+                amount = float(str(amount).replace("$", "").replace(",", ""))
+            except ValueError:
+                amount = 0
+        who = entry.get("client_or_event") or entry.get("vendor") or ""
+        detail = f"{entry.get('date', '?')}"
+        if who:
+            detail += f" | {who}"
+        detail += f" | ${amount:,.2f}"
+        lines.append(f"• {detail}")
+        if existing.get("discord_link"):
+            lines.append(f"  Existing thread: {existing['discord_link']}")
+
+    lines.append("\nReply **yes** to save anyway, or **skip** to discard.")
+    return "\n".join(lines)
+
+
+def _format_skipped_duplicates(
+    all_entries: list[dict],
+    skipped: list[tuple[int, dict]],
+) -> str:
+    """Format info about entries that were auto-skipped as duplicates."""
+    count = len(skipped)
+    lines = [f"\n:white_check_mark: **Skipped {count} likely duplicate{'s' if count > 1 else ''}:**"]
+    for new_idx, existing in skipped:
+        entry = all_entries[new_idx]
+        amount = entry.get("amount", 0)
+        if isinstance(amount, str):
+            try:
+                amount = float(str(amount).replace("$", "").replace(",", ""))
+            except ValueError:
+                amount = 0
+        who = entry.get("client_or_event") or entry.get("vendor") or ""
+        detail = f"{entry.get('date', '?')}"
+        if who:
+            detail += f" | {who}"
+        detail += f" | ${amount:,.2f}"
+        lines.append(f"• {detail} _(already in spreadsheet)_")
+    return "\n".join(lines)
+
+
+async def _filter_duplicates(
+    entries: list[dict],
+    exclude_discord_link: str | None = None,
+    tab_name: str = "Entries",
+) -> tuple[list[dict], list[tuple[int, dict]]]:
+    """Check entries for duplicates against recent sheet data.
+
+    Returns (entries_to_save, duplicate_pairs) where duplicate_pairs is
+    a list of (original_entry_index, matching_existing_entry).
+    Excludes the conversation's own sheet rows to avoid self-matching.
+    """
+    try:
+        recent = await sheets_manager.get_recent_entries(days=90, tab_name=tab_name)
+        if exclude_discord_link:
+            recent = [r for r in recent if r.get("discord_link") != exclude_discord_link]
+        duplicates = _find_duplicates(entries, recent)
+    except Exception:
+        logger.exception("op=filter_duplicates | Duplicate check failed, skipping")
+        return entries, []
+
+    if not duplicates:
+        return entries, []
+
+    dup_indices = {idx for idx, _ in duplicates}
+    clean = [e for i, e in enumerate(entries) if i not in dup_indices]
+    return clean, duplicates
+
+
+# ---------------------------------------------------------------------------
 # Core lifecycle operations
 # ---------------------------------------------------------------------------
 
@@ -158,6 +362,7 @@ async def create_entry(
     text: str | None,
     images: list[tuple[bytes, str]] | None,
     audio: tuple[bytes, str] | None,
+    tab_name: str = "Entries",
 ) -> ProcessingResult:
     """Process a new message: transcribe media, extract data, decide save vs ask.
 
@@ -199,6 +404,7 @@ async def create_entry(
         confidence=result.confidence,
         questions=result.clarifying_questions,
         raw_summary=result.raw_summary,
+        tab_name=tab_name,
     )
 
     # 6. Record the initial bot response in conversation history
@@ -215,22 +421,70 @@ async def create_entry(
     )
 
     if is_confident:
-        # Auto-save to sheet
-        row_numbers = await sheets_manager.append_entries(entries_dicts, message_url)
+        # Check for duplicates before auto-saving
+        entries_to_save, skipped = await _filter_duplicates(entries_dicts, tab_name=tab_name)
+
+        if skipped and not entries_to_save:
+            # ALL entries are duplicates — hold everything, let user decide
+            response_text = _format_duplicate_warning(entries_dicts, skipped)
+            await db.add_message(thread_id, "bot", response_text)
+            await db.update_conversation_status(thread_id, "pending_duplicate_review")
+
+            elapsed = time.monotonic() - t0
+            logger.info(
+                "thread=%d op=create_entry | %.1fs, all %d entries are duplicates, holding",
+                thread_id, elapsed, len(skipped),
+            )
+
+            return ProcessingResult(
+                response_text=response_text,
+                status="pending_clarification",
+                audio_transcription=audio_transcription,
+            )
+
+        if skipped:
+            # SOME are duplicates — save non-dupes, skip dupes, report both
+            row_numbers = await sheets_manager.append_entries(
+                entries_to_save, message_url, tab_name=tab_name
+            )
+            await db.update_conversation_entries(
+                thread_id=thread_id,
+                entries=entries_to_save,
+                confidence=result.confidence,
+                questions=[],
+                raw_summary=result.raw_summary,
+            )
+            await db.update_conversation_status(thread_id, "saved", row_numbers)
+
+            response_text = _format_result_message(
+                entries_to_save, [], result.raw_summary, saved=True
+            )
+            response_text += "\n" + _format_skipped_duplicates(entries_dicts, skipped)
+            await db.add_message(thread_id, "bot", response_text)
+
+            elapsed = time.monotonic() - t0
+            logger.info(
+                "thread=%d op=create_entry | %.1fs, saved %d entries, skipped %d duplicates",
+                thread_id, elapsed, len(entries_to_save), len(skipped),
+            )
+
+            return ProcessingResult(
+                response_text=response_text,
+                status="saved",
+                entries_saved=len(row_numbers),
+                audio_transcription=audio_transcription,
+            )
+
+        # No duplicates — auto-save all to sheet
+        row_numbers = await sheets_manager.append_entries(
+            entries_dicts, message_url, tab_name=tab_name
+        )
         await db.update_conversation_status(thread_id, "saved", row_numbers)
 
         response_text = _format_result_message(
             entries_dicts, [], result.raw_summary, saved=True
         )
         await db.add_message(thread_id, "bot", response_text)
-
-        # Log to conversation log
-        await sheets_manager.log_conversation(
-            user_input=text or "(attachment)",
-            bot_response=response_text[:500],
-            outcome="auto-confirmed",
-            discord_link=message_url,
-        )
 
         elapsed = time.monotonic() - t0
         logger.info(
@@ -320,18 +574,38 @@ async def process_reply(
     # 3. Record user message (with transcription context)
     await db.add_message(thread_id, "user", correction_text)
 
-    # 4. Check for simple confirmation
+    # 4. Check for skip/discard (duplicate rejection)
     text_to_check = correction_text.strip().lower()
+    if text_to_check in SKIP_WORDS and conv["status"] != "saved":
+        await db.update_conversation_status(thread_id, "skipped")
+        response_text = "Got it — this entry has been discarded and won't be saved."
+        await db.add_message(thread_id, "bot", response_text)
+
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "thread=%d op=process_reply | %.1fs, user skipped/discarded entry",
+            thread_id, elapsed,
+        )
+
+        return ProcessingResult(
+            response_text=response_text,
+            status="skipped",
+            audio_transcription=reply_transcription,
+        )
+
+    # 5. Check for simple confirmation
     if (
         text_to_check in CONFIRM_WORDS
         and len(entries) > 0
         and conv["status"] != "saved"
     ):
-        result = await _confirm_and_save(thread_id, conv, t0)
+        # If user is confirming after a duplicate warning, force save without re-checking
+        force = conv["status"] == "pending_duplicate_review"
+        result = await _confirm_and_save(thread_id, conv, t0, force_save=force)
         result.audio_transcription = reply_transcription
         return result
 
-    # 5. Field-level correction via Gemini
+    # 6. Field-level correction via Gemini
     conversation_history = await db.get_messages(thread_id)
     followup = await gemini_processor.process_correction(
         current_entries=entries,
@@ -339,10 +613,11 @@ async def process_reply(
         user_reply=correction_text,
     )
 
-    # 6. Handle pure confirmation from Gemini
+    # 7. Handle pure confirmation from Gemini
     if followup.is_confirmation and not followup.field_updates:
         if conv["status"] != "saved" and len(entries) > 0:
-            result = await _confirm_and_save(thread_id, conv, t0)
+            force = conv["status"] == "pending_duplicate_review"
+            result = await _confirm_and_save(thread_id, conv, t0, force_save=force)
             result.audio_transcription = reply_transcription
             return result
         else:
@@ -353,7 +628,7 @@ async def process_reply(
                 audio_transcription=reply_transcription,
             )
 
-    # 7. Apply field updates
+    # 8. Apply field updates
     fields_changed = []
     for update in followup.field_updates:
         idx = update.entry_index
@@ -386,7 +661,7 @@ async def process_reply(
         raw_summary=conv["raw_summary"],
     )
 
-    # 8. If no remaining questions, save (or update in place)
+    # 9. If no remaining questions, save (or update in place)
     if not followup.remaining_questions:
         result = await _save_entries(
             thread_id, conv, entries, fields_changed, message_url, t0
@@ -394,7 +669,7 @@ async def process_reply(
         result.audio_transcription = reply_transcription
         return result
 
-    # 9. Still have questions — ask them
+    # 10. Still have questions — ask them
     response_text = _format_correction_message(
         entries, fields_changed, followup.remaining_questions, saved=False
     )
@@ -423,47 +698,79 @@ async def _confirm_and_save(
     thread_id: int,
     conv: dict,
     t0: float,
+    force_save: bool = False,
 ) -> ProcessingResult:
     """Save entries to sheet when user confirms."""
     entries = conv["entries"]
     message_url = conv["message_url"]
+    tab_name = conv.get("tab_name", "Entries")
+    skipped: list[tuple[int, dict]] = []
 
     if conv["status"] == "saved" and conv["sheet_row_numbers"]:
-        # Already saved — update in place
+        # Already saved — update in place (no duplicate check needed)
         for i, row_num in enumerate(conv["sheet_row_numbers"]):
             if i < len(entries):
                 await sheets_manager.update_entry_in_place(
-                    row_num, entries[i], message_url
+                    row_num, entries[i], message_url, tab_name=tab_name
                 )
         row_numbers = conv["sheet_row_numbers"]
+        entries_to_save = entries
     else:
-        # First save
-        row_numbers = await sheets_manager.append_entries(entries, message_url)
+        # First save — check for duplicates unless user explicitly forced
+        entries_to_save = entries
+        if not force_save:
+            entries_to_save, skipped = await _filter_duplicates(
+                entries, exclude_discord_link=message_url, tab_name=tab_name
+            )
+
+            if skipped and not entries_to_save:
+                # ALL entries are duplicates — hold and warn
+                response_text = _format_duplicate_hold_message(entries, skipped)
+                await db.add_message(thread_id, "bot", response_text)
+                await db.update_conversation_status(thread_id, "pending_duplicate_review")
+                elapsed = time.monotonic() - t0
+                logger.info(
+                    "thread=%d op=confirm_save | %.1fs, all %d entries are duplicates, holding",
+                    thread_id, elapsed, len(entries),
+                )
+                return ProcessingResult(
+                    response_text=response_text,
+                    status="pending_clarification",
+                )
+
+        # If some entries were filtered, update conversation state
+        if skipped:
+            await db.update_conversation_entries(
+                thread_id=thread_id,
+                entries=entries_to_save,
+                confidence=conv["confidence"],
+                questions=[],
+                raw_summary=conv["raw_summary"],
+            )
+
+        row_numbers = await sheets_manager.append_entries(
+            entries_to_save, message_url, tab_name=tab_name
+        )
 
     await db.update_conversation_status(thread_id, "saved", row_numbers)
 
     response_text = _format_result_message(
-        entries, [], conv["raw_summary"], saved=True
+        entries_to_save, [], conv["raw_summary"], saved=True
     )
+    if skipped:
+        response_text += "\n" + _format_skipped_duplicates(entries, skipped)
     await db.add_message(thread_id, "bot", response_text)
-
-    await sheets_manager.log_conversation(
-        user_input=conv["original_text"] or "(attachment)",
-        bot_response=response_text[:500],
-        outcome="user-confirmed",
-        discord_link=message_url,
-    )
 
     elapsed = time.monotonic() - t0
     logger.info(
-        "thread=%d op=confirm_save | %.1fs, saved %d entries (rows %s)",
-        thread_id, elapsed, len(entries), row_numbers,
+        "thread=%d op=confirm_save | %.1fs, saved %d entries (rows %s), skipped %d duplicates",
+        thread_id, elapsed, len(entries_to_save), row_numbers, len(skipped),
     )
 
     return ProcessingResult(
         response_text=response_text,
         status="saved",
-        entries_saved=len(entries),
+        entries_saved=len(entries_to_save),
     )
 
 
@@ -477,12 +784,15 @@ async def _save_entries(
 ) -> ProcessingResult:
     """Save or update entries in the spreadsheet after corrections."""
     old_rows = conv["sheet_row_numbers"]
+    tab_name = conv.get("tab_name", "Entries")
+    skipped: list[tuple[int, dict]] = []
+    original_entries = list(entries)
 
     if old_rows and len(old_rows) == len(entries):
-        # Same number of entries — update in place (no deletion needed)
+        # Same number of entries — update in place (no duplicate check for corrections)
         for i, row_num in enumerate(old_rows):
             await sheets_manager.update_entry_in_place(
-                row_num, entries[i], message_url
+                row_num, entries[i], message_url, tab_name=tab_name
             )
         row_numbers = old_rows
         logger.info(
@@ -490,20 +800,52 @@ async def _save_entries(
             thread_id, len(row_numbers),
         )
     elif old_rows:
-        # Entry count changed — safe replace (write first, then delete)
+        # Entry count changed — safe replace (no duplicate check for corrections)
         row_numbers = await sheets_manager.safe_replace_entries(
-            old_rows, entries, message_url
+            old_rows, entries, message_url, tab_name=tab_name
         )
         logger.info(
             "thread=%d op=save_entries | Safe-replaced %d old rows with %d new",
             thread_id, len(old_rows), len(row_numbers),
         )
     else:
-        # Never saved before — just append
-        row_numbers = await sheets_manager.append_entries(entries, message_url)
+        # Never saved before — check for duplicates first
+        entries_to_save, skipped = await _filter_duplicates(
+            entries, exclude_discord_link=message_url, tab_name=tab_name
+        )
+
+        if skipped and not entries_to_save:
+            # ALL entries are duplicates — hold and warn
+            response_text = _format_duplicate_hold_message(entries, skipped)
+            await db.add_message(thread_id, "bot", response_text)
+            await db.update_conversation_status(thread_id, "pending_duplicate_review")
+            elapsed = time.monotonic() - t0
+            logger.info(
+                "thread=%d op=save_entries | %.1fs, all %d entries are duplicates, holding",
+                thread_id, elapsed, len(entries),
+            )
+            return ProcessingResult(
+                response_text=response_text,
+                status="pending_clarification",
+                fields_changed=fields_changed,
+            )
+
+        if skipped:
+            entries = entries_to_save
+            await db.update_conversation_entries(
+                thread_id=thread_id,
+                entries=entries,
+                confidence=1.0,
+                questions=[],
+                raw_summary=conv["raw_summary"],
+            )
+
+        row_numbers = await sheets_manager.append_entries(
+            entries, message_url, tab_name=tab_name
+        )
         logger.info(
-            "thread=%d op=save_entries | Appended %d new rows",
-            thread_id, len(row_numbers),
+            "thread=%d op=save_entries | Appended %d new rows, skipped %d duplicates",
+            thread_id, len(row_numbers), len(skipped),
         )
 
     await db.update_conversation_status(thread_id, "saved", row_numbers)
@@ -511,20 +853,14 @@ async def _save_entries(
     response_text = _format_correction_message(
         entries, fields_changed, [], saved=True
     )
+    if skipped:
+        response_text += "\n" + _format_skipped_duplicates(original_entries, skipped)
     await db.add_message(thread_id, "bot", response_text)
-
-    outcome = "corrected" if fields_changed else "auto-confirmed"
-    await sheets_manager.log_conversation(
-        user_input=conv["original_text"] or "(attachment)",
-        bot_response=response_text[:500],
-        outcome=outcome,
-        discord_link=message_url,
-    )
 
     elapsed = time.monotonic() - t0
     logger.info(
-        "thread=%d op=save_entries | %.1fs, saved %d entries, changes: %s",
-        thread_id, elapsed, len(entries), fields_changed or "none",
+        "thread=%d op=save_entries | %.1fs, saved %d entries, skipped %d duplicates, changes: %s",
+        thread_id, elapsed, len(entries), len(skipped), fields_changed or "none",
     )
 
     return ProcessingResult(

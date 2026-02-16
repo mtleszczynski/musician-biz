@@ -1,13 +1,16 @@
-"""Google Sheets operations for the Entries and Conversation Log tabs.
+"""Google Sheets operations for financial entries.
 
 gspread is synchronous — all public functions are async wrappers using
 asyncio.to_thread() so they don't block the Discord event loop.
+
+Each Discord channel maps to its own sheet tab (e.g. "Entries", "Test Entries").
+The tab_name parameter flows from config -> main -> entry_manager -> here.
 """
 
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -34,17 +37,6 @@ HEADERS = [
     "Discord Link",
     "Timestamp",
 ]
-
-LOG_HEADERS = [
-    "Timestamp",
-    "User Input",
-    "Bot Response",
-    "Outcome",
-    "Discord Link",
-]
-
-ENTRIES_TAB = "Entries"
-LOG_TAB = "Conversation Log"
 
 # Map from FinancialEntry field names to column indices (0-based)
 _FIELD_TO_COL = {
@@ -107,22 +99,18 @@ def _get_or_create_worksheet(
     return worksheet
 
 
-def _get_entries_worksheet() -> gspread.Worksheet:
-    """Return the Entries worksheet, creating it if needed."""
+def _get_entries_worksheet(tab_name: str = "Entries") -> gspread.Worksheet:
+    """Return the entries worksheet for the given tab, creating it if needed."""
     spreadsheet = _get_spreadsheet()
-    try:
-        sheet1 = spreadsheet.worksheet("Sheet1")
-        sheet1.update_title(ENTRIES_TAB)
-        logger.info("op=init | Renamed 'Sheet1' to '%s'", ENTRIES_TAB)
-    except gspread.WorksheetNotFound:
-        pass
-    return _get_or_create_worksheet(spreadsheet, ENTRIES_TAB, HEADERS)
-
-
-def _get_log_worksheet() -> gspread.Worksheet:
-    """Return the Conversation Log worksheet, creating it if needed."""
-    spreadsheet = _get_spreadsheet()
-    return _get_or_create_worksheet(spreadsheet, LOG_TAB, LOG_HEADERS)
+    # One-time migration: rename default Sheet1 to "Entries" if it exists
+    if tab_name == "Entries":
+        try:
+            sheet1 = spreadsheet.worksheet("Sheet1")
+            sheet1.update_title("Entries")
+            logger.info("op=init | Renamed 'Sheet1' to 'Entries'")
+        except gspread.WorksheetNotFound:
+            pass
+    return _get_or_create_worksheet(spreadsheet, tab_name, HEADERS)
 
 
 # ---------------------------------------------------------------------------
@@ -149,39 +137,42 @@ def _build_row(entry: dict, discord_link: str) -> list[str]:
     ]
 
 
-def _append_row_sync(row: list[str]) -> int:
-    """Append a single row to the Entries sheet. Returns the row number."""
-    worksheet = _get_entries_worksheet()
+def _append_row_sync(row: list[str], tab_name: str = "Entries") -> int:
+    """Append a single row to the given sheet tab. Returns the row number."""
+    worksheet = _get_entries_worksheet(tab_name)
     result = worksheet.append_row(row, value_input_option="USER_ENTERED")
     updated_range = result.get("updates", {}).get("updatedRange", "")
     try:
         row_num = int(updated_range.split("!")[1].split(":")[0][1:])
     except (IndexError, ValueError):
         row_num = len(worksheet.get_all_values())
-    logger.info("op=append_row | Appended row %d", row_num)
+    logger.info("op=append_row | tab=%s, appended row %d", tab_name, row_num)
     return row_num
 
 
-def _update_row_in_place_sync(row_number: int, entry: dict, discord_link: str) -> None:
+def _update_row_in_place_sync(
+    row_number: int, entry: dict, discord_link: str, tab_name: str = "Entries",
+) -> None:
     """Overwrite an existing row with updated entry data."""
-    worksheet = _get_entries_worksheet()
+    worksheet = _get_entries_worksheet(tab_name)
     row = _build_row(entry, discord_link)
     cell_range = f"A{row_number}:K{row_number}"
     worksheet.update(cell_range, [row], value_input_option="USER_ENTERED")
-    logger.info("op=update_in_place | Updated row %d", row_number)
+    logger.info("op=update_in_place | tab=%s, updated row %d", tab_name, row_number)
 
 
 def _safe_replace_sync(
     old_row_numbers: list[int],
     new_entries: list[dict],
     discord_link: str,
+    tab_name: str = "Entries",
 ) -> list[int]:
     """Write new rows first, then delete old rows. Returns new row numbers.
 
     This prevents data loss: if the write succeeds but delete fails, you have
     duplicates (recoverable) instead of missing data (not recoverable).
     """
-    worksheet = _get_entries_worksheet()
+    worksheet = _get_entries_worksheet(tab_name)
 
     # Step 1: Append new rows
     new_row_numbers = []
@@ -194,54 +185,56 @@ def _safe_replace_sync(
         except (IndexError, ValueError):
             row_num = len(worksheet.get_all_values())
         new_row_numbers.append(row_num)
-        logger.info("op=safe_replace | Appended new row %d", row_num)
+        logger.info("op=safe_replace | tab=%s, appended new row %d", tab_name, row_num)
 
     # Step 2: Delete old rows (in reverse to preserve row numbers)
     for row_num in sorted(old_row_numbers, reverse=True):
         try:
             worksheet.delete_rows(row_num)
-            logger.info("op=safe_replace | Deleted old row %d", row_num)
+            logger.info("op=safe_replace | tab=%s, deleted old row %d", tab_name, row_num)
             # Adjust new row numbers that shifted down
             new_row_numbers = [
                 n - 1 if n > row_num else n for n in new_row_numbers
             ]
         except Exception:
-            logger.exception("op=safe_replace | Failed to delete old row %d", row_num)
+            logger.exception("op=safe_replace | tab=%s, failed to delete old row %d", tab_name, row_num)
 
     return new_row_numbers
 
 
-def _delete_last_row_sync() -> dict | None:
-    """Delete the last data row from the Entries sheet."""
-    worksheet = _get_entries_worksheet()
+def _delete_last_row_sync(tab_name: str = "Entries") -> dict | None:
+    """Delete the last data row from the given sheet tab."""
+    worksheet = _get_entries_worksheet(tab_name)
     all_values = worksheet.get_all_values()
     if len(all_values) <= 1:
         return None
     last_row = all_values[-1]
     worksheet.delete_rows(len(all_values))
-    logger.info("op=delete_last | Deleted row %d", len(all_values))
+    logger.info("op=delete_last | tab=%s, deleted row %d", tab_name, len(all_values))
     return {HEADERS[i]: last_row[i] for i in range(min(len(HEADERS), len(last_row)))}
 
 
-def _delete_rows_sync(row_numbers: list[int]) -> int:
+def _delete_rows_sync(row_numbers: list[int], tab_name: str = "Entries") -> int:
     """Delete specific rows. Returns count deleted."""
     if not row_numbers:
         return 0
-    worksheet = _get_entries_worksheet()
+    worksheet = _get_entries_worksheet(tab_name)
     count = 0
     for row_num in sorted(row_numbers, reverse=True):
         try:
             worksheet.delete_rows(row_num)
             count += 1
-            logger.info("op=delete_rows | Deleted row %d", row_num)
+            logger.info("op=delete_rows | tab=%s, deleted row %d", tab_name, row_num)
         except Exception:
-            logger.exception("op=delete_rows | Failed to delete row %d", row_num)
+            logger.exception("op=delete_rows | tab=%s, failed to delete row %d", tab_name, row_num)
     return count
 
 
-def _find_rows_by_discord_link_sync(discord_link: str) -> list[int]:
+def _find_rows_by_discord_link_sync(
+    discord_link: str, tab_name: str = "Entries",
+) -> list[int]:
     """Find all row numbers matching a Discord link."""
-    worksheet = _get_entries_worksheet()
+    worksheet = _get_entries_worksheet(tab_name)
     all_values = worksheet.get_all_values()
     discord_link_col = HEADERS.index("Discord Link")
     row_numbers = []
@@ -251,9 +244,48 @@ def _find_rows_by_discord_link_sync(discord_link: str) -> list[int]:
     return row_numbers
 
 
-def _get_monthly_summary_sync(month: int, year: int) -> dict:
+def _get_recent_entries_sync(days: int = 90, tab_name: str = "Entries") -> list[dict]:
+    """Fetch entries from the last N days for duplicate detection."""
+    worksheet = _get_entries_worksheet(tab_name)
+    all_values = worksheet.get_all_values()
+
+    cutoff = datetime.now() - timedelta(days=days)
+    results: list[dict] = []
+
+    for row_num, row in enumerate(all_values[1:], start=2):
+        if len(row) < 7:
+            continue
+        try:
+            row_date = datetime.strptime(row[0], "%Y-%m-%d")
+        except ValueError:
+            continue
+        if row_date < cutoff:
+            continue
+
+        try:
+            amount = float(row[6].replace("$", "").replace(",", ""))
+        except ValueError:
+            amount = 0.0
+
+        results.append({
+            "date": row[0],
+            "type": row[1].lower(),
+            "category": row[2],
+            "client_or_event": row[3] if len(row) > 3 else "",
+            "vendor": row[4] if len(row) > 4 else "",
+            "amount": amount,
+            "description": row[7] if len(row) > 7 else "",
+            "discord_link": row[9] if len(row) > 9 else "",
+            "row_number": row_num,
+        })
+
+    logger.info("op=get_recent_entries | tab=%s, found %d entries in last %d days", tab_name, len(results), days)
+    return results
+
+
+def _get_monthly_summary_sync(month: int, year: int, tab_name: str = "Entries") -> dict:
     """Get income/expense totals by category for a given month."""
-    worksheet = _get_entries_worksheet()
+    worksheet = _get_entries_worksheet(tab_name)
     all_values = worksheet.get_all_values()
 
     income: dict[str, float] = {}
@@ -289,90 +321,75 @@ def _get_monthly_summary_sync(month: int, year: int) -> dict:
     }
 
 
-def _log_conversation_sync(
-    user_input: str,
-    bot_response: str,
-    outcome: str,
-    discord_link: str,
-) -> None:
-    """Append a row to the Conversation Log tab."""
-    worksheet = _get_log_worksheet()
-    row = [
-        datetime.now().isoformat(),
-        user_input[:500],
-        bot_response[:500],
-        outcome,
-        discord_link,
-    ]
-    worksheet.append_row(row, value_input_option="USER_ENTERED")
-    logger.info("op=log_conversation | outcome=%s", outcome)
-
-
 # ---------------------------------------------------------------------------
 # Async wrappers
 # ---------------------------------------------------------------------------
 
-async def append_entry(entry: dict, discord_link: str) -> int:
+async def append_entry(entry: dict, discord_link: str, tab_name: str = "Entries") -> int:
     """Append a financial entry to the sheet. Returns the row number."""
     row = _build_row(entry, discord_link)
-    return await asyncio.to_thread(_append_row_sync, row)
+    return await asyncio.to_thread(_append_row_sync, row, tab_name)
 
 
-async def append_entries(entries: list[dict], discord_link: str) -> list[int]:
+async def append_entries(
+    entries: list[dict], discord_link: str, tab_name: str = "Entries",
+) -> list[int]:
     """Append multiple entries. Returns list of row numbers."""
     row_numbers = []
     for entry in entries:
         row = _build_row(entry, discord_link)
-        row_num = await asyncio.to_thread(_append_row_sync, row)
+        row_num = await asyncio.to_thread(_append_row_sync, row, tab_name)
         row_numbers.append(row_num)
     return row_numbers
 
 
 async def update_entry_in_place(
-    row_number: int, entry: dict, discord_link: str
+    row_number: int, entry: dict, discord_link: str, tab_name: str = "Entries",
 ) -> None:
     """Update an existing row in-place with new entry data."""
-    await asyncio.to_thread(_update_row_in_place_sync, row_number, entry, discord_link)
+    await asyncio.to_thread(
+        _update_row_in_place_sync, row_number, entry, discord_link, tab_name
+    )
 
 
 async def safe_replace_entries(
     old_row_numbers: list[int],
     new_entries: list[dict],
     discord_link: str,
+    tab_name: str = "Entries",
 ) -> list[int]:
     """Write new entries first, then delete old ones. Returns new row numbers."""
     return await asyncio.to_thread(
-        _safe_replace_sync, old_row_numbers, new_entries, discord_link
+        _safe_replace_sync, old_row_numbers, new_entries, discord_link, tab_name
     )
 
 
-async def find_rows_by_discord_link(discord_link: str) -> list[int]:
+async def find_rows_by_discord_link(
+    discord_link: str, tab_name: str = "Entries",
+) -> list[int]:
     """Find all row numbers matching a Discord link."""
-    return await asyncio.to_thread(_find_rows_by_discord_link_sync, discord_link)
-
-
-async def delete_rows(row_numbers: list[int]) -> int:
-    """Delete specific rows. Returns count deleted."""
-    return await asyncio.to_thread(_delete_rows_sync, row_numbers)
-
-
-async def delete_last_entry() -> dict | None:
-    """Delete the last entry. Returns the deleted data or None."""
-    return await asyncio.to_thread(_delete_last_row_sync)
-
-
-async def get_monthly_summary(month: int, year: int) -> dict:
-    """Get monthly income/expense summary by category."""
-    return await asyncio.to_thread(_get_monthly_summary_sync, month, year)
-
-
-async def log_conversation(
-    user_input: str,
-    bot_response: str,
-    outcome: str,
-    discord_link: str,
-) -> None:
-    """Log a conversation to the Conversation Log tab."""
-    await asyncio.to_thread(
-        _log_conversation_sync, user_input, bot_response, outcome, discord_link
+    return await asyncio.to_thread(
+        _find_rows_by_discord_link_sync, discord_link, tab_name
     )
+
+
+async def delete_rows(row_numbers: list[int], tab_name: str = "Entries") -> int:
+    """Delete specific rows. Returns count deleted."""
+    return await asyncio.to_thread(_delete_rows_sync, row_numbers, tab_name)
+
+
+async def delete_last_entry(tab_name: str = "Entries") -> dict | None:
+    """Delete the last entry. Returns the deleted data or None."""
+    return await asyncio.to_thread(_delete_last_row_sync, tab_name)
+
+
+async def get_recent_entries(days: int = 90, tab_name: str = "Entries") -> list[dict]:
+    """Fetch entries from the last N days for duplicate detection."""
+    return await asyncio.to_thread(_get_recent_entries_sync, days, tab_name)
+
+
+async def get_monthly_summary(
+    month: int, year: int, tab_name: str = "Entries",
+) -> dict:
+    """Get monthly income/expense summary by category."""
+    return await asyncio.to_thread(_get_monthly_summary_sync, month, year, tab_name)

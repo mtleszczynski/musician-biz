@@ -18,7 +18,7 @@ from discord.ext import commands
 import db
 import entry_manager
 import sheets_manager
-from config import CHANNEL_ID, DISCORD_TOKEN, setup_logging
+from config import CHANNEL_TAB_MAP, DISCORD_TOKEN, get_tab_for_channel, setup_logging
 
 # ---------------------------------------------------------------------------
 # Logging — must be configured before anything else logs
@@ -117,10 +117,11 @@ async def on_ready():
     logger.info(
         "op=startup | Bot ready as %s (ID: %s)", bot.user.name, bot.user.id
     )
-    if CHANNEL_ID:
-        logger.info("op=startup | Listening in channel %s", CHANNEL_ID)
+    if CHANNEL_TAB_MAP:
+        for ch_id, tab in CHANNEL_TAB_MAP.items():
+            logger.info("op=startup | Listening in channel %s -> tab '%s'", ch_id, tab)
     else:
-        logger.warning("op=startup | CHANNEL_ID not set — bot won't process messages")
+        logger.warning("op=startup | No channels configured — bot won't process messages")
 
 
 @bot.event
@@ -134,19 +135,16 @@ async def on_message(message: discord.Message):
     if ctx.valid:
         return
 
-    # New message in the designated channel (not a thread)
-    if (
-        CHANNEL_ID
-        and str(message.channel.id) == str(CHANNEL_ID)
-        and not isinstance(message.channel, discord.Thread)
-    ):
-        await handle_new_entry(message)
+    # New message in a monitored channel (not a thread)
+    channel_id_str = str(message.channel.id)
+    if channel_id_str in CHANNEL_TAB_MAP and not isinstance(message.channel, discord.Thread):
+        await handle_new_entry(message, CHANNEL_TAB_MAP[channel_id_str])
 
-    # Reply in a thread whose parent is the expenses channel
+    # Reply in a thread whose parent is a monitored channel
     elif (
         isinstance(message.channel, discord.Thread)
         and message.channel.parent_id
-        and str(message.channel.parent_id) == str(CHANNEL_ID)
+        and str(message.channel.parent_id) in CHANNEL_TAB_MAP
     ):
         await handle_thread_reply(message)
 
@@ -155,8 +153,9 @@ async def on_message(message: discord.Message):
 # New entry handler
 # ---------------------------------------------------------------------------
 
-async def handle_new_entry(message: discord.Message):
-    """Process a new message in the expenses channel."""
+async def handle_new_entry(message: discord.Message, tab_name: str = "Entries"):
+    """Process a new message in a monitored channel."""
+    thread = None
     try:
         await message.add_reaction(EMOJI_PROCESSING)
 
@@ -181,6 +180,7 @@ async def handle_new_entry(message: discord.Message):
             text=text,
             images=images,
             audio=audio,
+            tab_name=tab_name,
         )
 
         # Post audio transcription if present (so user can see what was heard)
@@ -201,16 +201,20 @@ async def handle_new_entry(message: discord.Message):
     except Exception:
         logger.exception("thread=new op=handle_new_entry | Error")
         await set_reaction(message, EMOJI_ERROR)
+        error_msg = (
+            "Sorry, something went wrong processing this message. "
+            "Please try again or check the bot logs."
+        )
         try:
-            thread = await message.create_thread(
-                name="Error", auto_archive_duration=60
-            )
-            await thread.send(
-                "Sorry, something went wrong processing this message. "
-                "Please try again or check the bot logs."
-            )
+            if thread is not None:
+                await thread.send(error_msg)
+            else:
+                thread = await message.create_thread(
+                    name="Error", auto_archive_duration=60
+                )
+                await thread.send(error_msg)
         except Exception:
-            logger.exception("op=handle_new_entry | Failed to create error thread")
+            logger.exception("op=handle_new_entry | Failed to send error message")
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +258,7 @@ async def handle_thread_reply(message: discord.Message):
         await message.channel.send(result.response_text)
 
         # Set emoji on the reply
-        if result.status == "saved":
+        if result.status in ("saved", "skipped"):
             await set_reaction(message, EMOJI_DONE)
         elif result.status == "error":
             await set_reaction(message, EMOJI_ERROR)
@@ -265,7 +269,7 @@ async def handle_thread_reply(message: discord.Message):
         try:
             original_msg = message.channel.starter_message
             if original_msg:
-                if result.status == "saved":
+                if result.status in ("saved", "skipped"):
                     await set_reaction(original_msg, EMOJI_DONE)
                 elif result.status == "error":
                     await set_reaction(original_msg, EMOJI_ERROR)
@@ -292,10 +296,11 @@ async def handle_thread_reply(message: discord.Message):
 @bot.command(name="help")
 async def help_command(ctx: commands.Context):
     """Show available commands and usage instructions."""
+    channel_mentions = " or ".join(f"<#{ch}>" for ch in CHANNEL_TAB_MAP)
     help_text = (
         "**Musician Expense Tracker — Help**\n\n"
         "**How to use:**\n"
-        f"Send a message in <#{CHANNEL_ID}> with any combination of:\n"
+        f"Send a message in {channel_mentions} with any combination of:\n"
         "• A photo of a receipt or invoice\n"
         "• A text description of income or an expense\n"
         "• A voice message describing the transaction\n\n"
@@ -320,8 +325,10 @@ async def summary_command(ctx: commands.Context, month: int = 0, year: int = 0):
         year = now.year
 
     try:
+        # Determine which tab to query based on the channel
+        tab = get_tab_for_channel(ctx.channel.id) or "Entries"
         await ctx.message.add_reaction(EMOJI_PROCESSING)
-        data = await sheets_manager.get_monthly_summary(month, year)
+        data = await sheets_manager.get_monthly_summary(month, year, tab_name=tab)
         await ctx.message.remove_reaction(EMOJI_PROCESSING, bot.user)
 
         month_name = datetime(year, month, 1).strftime("%B %Y")
@@ -357,8 +364,9 @@ async def summary_command(ctx: commands.Context, month: int = 0, year: int = 0):
 async def undo_command(ctx: commands.Context):
     """Remove the last entry from the spreadsheet."""
     try:
+        tab = get_tab_for_channel(ctx.channel.id) or "Entries"
         await ctx.message.add_reaction(EMOJI_PROCESSING)
-        deleted = await sheets_manager.delete_last_entry()
+        deleted = await sheets_manager.delete_last_entry(tab_name=tab)
         await ctx.message.remove_reaction(EMOJI_PROCESSING, bot.user)
 
         if deleted:
@@ -400,8 +408,8 @@ def main():
     if not DISCORD_TOKEN:
         logger.error("op=startup | DISCORD_TOKEN is not set")
         sys.exit(1)
-    if not CHANNEL_ID:
-        logger.warning("op=startup | CHANNEL_ID not set — bot won't process messages")
+    if not CHANNEL_TAB_MAP:
+        logger.warning("op=startup | No channels configured — bot won't process messages")
 
     logger.info("op=startup | Starting bot...")
     bot.run(DISCORD_TOKEN, log_handler=None)
