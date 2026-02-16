@@ -31,6 +31,7 @@ class ProcessingResult:
     status: str = "pending_clarification"  # saved | pending_clarification | error
     entries_saved: int = 0
     fields_changed: list[str] = field(default_factory=list)
+    audio_transcription: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +242,7 @@ async def create_entry(
             response_text=response_text,
             status="saved",
             entries_saved=len(row_numbers),
+            audio_transcription=audio_transcription,
         )
 
     else:
@@ -260,6 +262,7 @@ async def create_entry(
         return ProcessingResult(
             response_text=response_text,
             status="pending_clarification",
+            audio_transcription=audio_transcription,
         )
 
 
@@ -295,15 +298,16 @@ async def process_reply(
     #    In a thread reply, media is a correction (voice note, updated receipt),
     #    NOT a new financial entry. Transcribe to text and treat as a text correction.
     correction_text = user_text
+    reply_transcription: str | None = None
     if audio:
         audio_bytes, mime_type = audio
-        transcription = await gemini_processor.transcribe_audio(audio_bytes, mime_type)
+        reply_transcription = await gemini_processor.transcribe_audio(audio_bytes, mime_type)
         if message_id:
-            await db.cache_media(message_id, "audio", transcription, mime_type)
-        correction_text = f"{user_text}\n[Audio]: {transcription}".strip()
+            await db.cache_media(message_id, "audio", reply_transcription, mime_type)
+        correction_text = f"{user_text}\n[Audio]: {reply_transcription}".strip()
         logger.info(
             "thread=%d op=process_reply | Transcribed voice reply: %s",
-            thread_id, transcription[:100],
+            thread_id, reply_transcription[:100],
         )
 
     if images:
@@ -323,7 +327,9 @@ async def process_reply(
         and len(entries) > 0
         and conv["status"] != "saved"
     ):
-        return await _confirm_and_save(thread_id, conv, t0)
+        result = await _confirm_and_save(thread_id, conv, t0)
+        result.audio_transcription = reply_transcription
+        return result
 
     # 5. Field-level correction via Gemini
     conversation_history = await db.get_messages(thread_id)
@@ -336,11 +342,16 @@ async def process_reply(
     # 6. Handle pure confirmation from Gemini
     if followup.is_confirmation and not followup.field_updates:
         if conv["status"] != "saved" and len(entries) > 0:
-            return await _confirm_and_save(thread_id, conv, t0)
+            result = await _confirm_and_save(thread_id, conv, t0)
+            result.audio_transcription = reply_transcription
+            return result
         else:
             response_text = "It looks like this entry is already saved. Reply if you need to make changes."
             await db.add_message(thread_id, "bot", response_text)
-            return ProcessingResult(response_text=response_text, status="saved")
+            return ProcessingResult(
+                response_text=response_text, status="saved",
+                audio_transcription=reply_transcription,
+            )
 
     # 7. Apply field updates
     fields_changed = []
@@ -377,9 +388,11 @@ async def process_reply(
 
     # 8. If no remaining questions, save (or update in place)
     if not followup.remaining_questions:
-        return await _save_entries(
+        result = await _save_entries(
             thread_id, conv, entries, fields_changed, message_url, t0
         )
+        result.audio_transcription = reply_transcription
+        return result
 
     # 9. Still have questions — ask them
     response_text = _format_correction_message(
@@ -398,6 +411,7 @@ async def process_reply(
         response_text=response_text,
         status="pending_clarification",
         fields_changed=fields_changed,
+        audio_transcription=reply_transcription,
     )
 
 

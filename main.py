@@ -183,6 +183,12 @@ async def handle_new_entry(message: discord.Message):
             audio=audio,
         )
 
+        # Post audio transcription if present (so user can see what was heard)
+        if result.audio_transcription:
+            await thread.send(
+                f"**Heard:** {result.audio_transcription}"
+            )
+
         # Post the response in the thread
         await thread.send(result.response_text)
 
@@ -229,6 +235,12 @@ async def handle_thread_reply(message: discord.Message):
             images=images if images else None,
             audio=audio,
         )
+
+        # Post audio transcription if present (so user can see what was heard)
+        if result.audio_transcription:
+            await message.channel.send(
+                f"**Heard:** {result.audio_transcription}"
+            )
 
         # Post response
         await message.channel.send(result.response_text)
