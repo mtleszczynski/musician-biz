@@ -6,23 +6,38 @@ alwaysApply: true
 
 # Musician Expense Tracker — Cursor Rules
 
-## Project Overview
-Discord bot for a musician/music teacher to track income & expenses via photos, text,
-and audio messages. Uses Gemini 3 Flash for data extraction, Google Sheets for storage,
-SQLite for persistent state. High-confidence entries are auto-saved; low-confidence
-entries prompt for clarification. Corrections use field-level updates, not full re-extraction.
+Concise conventions loaded on every code edit. The full reference,
+architecture diagrams, contracts, and incident history live in **AGENTS.md**.
+Always read AGENTS.md before making non-trivial architectural changes.
 
-## Architecture Awareness
-- `main.py` — Thin Discord event dispatcher. Downloads attachments, manages emoji, creates threads. Delegates all logic to entry_manager.
-- `entry_manager.py` — Entry lifecycle orchestration. Creates entries, processes corrections, confirms, saves. The central coordination layer.
-- `gemini_processor.py` — Gemini API calls. Uses `google-genai` SDK (NOT `google-generativeai`). Transcribes audio, describes images, extracts data, processes field-level corrections.
-- `sheets_manager.py` — Google Sheets via `gspread`. Each channel maps to its own tab (e.g. "Entries", "Test Entries"). Supports append, update-in-place, and safe-replace. All functions accept `tab_name` parameter. Sync library wrapped in `asyncio.to_thread()`.
-- `db.py` — SQLite via `aiosqlite`. Three tables: conversations (entry state + tab_name), media_cache (transcriptions/descriptions), conversation_messages (thread history).
-- `prompts.py` — System prompts AND Pydantic response models. Models: FinancialEntry, ExtractionResult (initial extraction), FieldUpdate, FollowupResult (corrections). Tightly coupled with prompt text.
-- `config.py` — Env var loading + `setup_logging()`. Handles full Sheet URLs automatically. Builds `CHANNEL_TAB_MAP` from `PROD_CHANNEL_ID` and `TEST_CHANNEL_ID`.
+## Project Overview
+Discord bot for a musician/music teacher to track income & expenses via
+photos, text, and audio. Uses Gemini 3 Flash for extraction, Google Sheets
+for storage, SQLite (aiosqlite) for persistent state. High-confidence entries
+auto-save; low-confidence prompt for clarification. Corrections are
+field-level updates, not full re-extraction. Bot deployed on Fly.io
+(`shared-cpu-1x:512mb`) with a persistent volume for SQLite at `/data`.
+
+## File Responsibilities
+- `main.py` — Thin Discord event dispatcher. Owns emoji reactions,
+  attachment download, thread creation, mention resolution, retry/delete
+  orchestrators. Delegates extraction logic to entry_manager.
+- `entry_manager.py` — Entry lifecycle. Creates entries, processes
+  corrections, runs dedupe, classifies retry/delete intent, coordinates
+  db + gemini + sheets.
+- `gemini_processor.py` — Gemini API. Transcribe audio, describe images,
+  extract financial data, process corrections. Image resize (Pillow with
+  `draft()` mode). Retry + 90s timeout wrapping.
+- `sheets_manager.py` — Google Sheets CRUD via `gspread`. All public
+  functions accept `tab_name`. Sync library, wrap in `asyncio.to_thread()`.
+- `db.py` — SQLite via `aiosqlite`. Three tables: conversations (state +
+  tab_name + user_id), media_cache, conversation_messages.
+- `prompts.py` — System prompts AND Pydantic models. Tightly coupled —
+  change them together.
+- `config.py` — Env vars, logging setup, channel→tab map.
 
 ## Spreadsheet Schema
-Entries tab columns: Date, Type, Category, Client/Event, Vendor, Mode of Payment,
+Columns: Date, Type, Category, Client/Event, Vendor, Mode of Payment,
 Amount ($), Description, Notes, Discord Link, Timestamp.
 
 Categories:
@@ -32,43 +47,104 @@ Categories:
 Client/Event and Mode of Payment are income-only. Vendor is expense-only.
 
 ## Coding Conventions
-- Python 3.11+ with type hints on all functions.
-- Async/await for all I/O operations. The Discord bot loop is async.
-- Use `logging` module with structured context: `thread=X op=Y | message`.
-- Handle exceptions in Discord event handlers — never let them crash the bot.
-  Report errors to the user in the Discord thread.
-- Keep imports sorted: stdlib → third-party → local.
+- Python 3.11+ with type hints on all function signatures.
+- Async/await for all I/O. The Discord bot loop is async.
+- `logging` with structured context: `thread=X op=Y | message`. Log
+  elapsed time for Gemini calls and sheet ops.
+- Catch exceptions in Discord event handlers — never crash the loop.
+  Report errors to the user in the thread.
+- Imports: stdlib → third-party → local.
 
 ## Key Libraries
-- `discord.py` — Discord bot framework. Use `commands.Bot`, not raw `Client`.
-- `google-genai` — Gemini API. Use `client.aio.models.generate_content()` for async.
-  Use `types.Part.from_bytes()` for inline image/audio data.
-  Use `response_schema=PydanticModel` for structured JSON output.
-- `gspread` — Google Sheets. Synchronous — always wrap in `asyncio.to_thread()`.
-- `aiosqlite` — Async SQLite. Used in db.py for persistent state.
+- `discord.py` — Use `commands.Bot`, not raw `Client`.
+- `google-genai` — Use `client.aio.models.generate_content()` for async.
+  `types.Part.from_bytes()` for inline image/audio. `response_schema=Model`
+  for structured JSON. NOT `google-generativeai` (different package).
+- `gspread` — Synchronous; always wrap in `asyncio.to_thread()`.
+- `aiosqlite` — Async SQLite for db.py.
+- `Pillow` — Image resize; CPU-bound, also wrap in `asyncio.to_thread()`.
 
 ## Emoji Reactions
-- Hourglass: processing
-- Green checkmark: saved to sheet
-- Speech bubble: waiting for user clarification
-- Red X: actual error only (never for "needs input")
+- ⏳ Processing
+- ✅ Saved to sheet (or reply acknowledged)
+- 💬 Waiting for user input
+- ❌ Caught error
+- ❓ No extractable content
+- 🗑️ Entries deleted by user
+
+Use `main.set_reaction(message, emoji)` — it blind-removes all known bot
+reactions before adding the new one (don't trust `message.reactions` cache;
+it can be stale during long-running operations).
 
 ## Critical Design Rules
-- **Corrections use field-level updates** (FollowupResult with FieldUpdate list), NOT full re-extraction. Never re-evaluate fields the user didn't mention.
-- **Never delete sheet rows before new rows are written.** Use update-in-place for same-count corrections, safe-replace (write-then-delete) for count changes.
-- **Audio is transcribed once and cached in SQLite.** Never re-send raw audio bytes to Gemini after the initial transcription.
-- **All conversation state lives in SQLite (db.py).** No in-memory dicts for pending entries. Bot restarts are instant — no reconstruction needed.
+
+### Corrections and saves
+- Corrections use **field-level updates** (FollowupResult with FieldUpdate
+  list), NOT full re-extraction. Never re-evaluate fields the user didn't
+  mention.
+- For already-saved entries, **always mirror field changes to the sheet
+  immediately** via `update_entry_in_place`, even if Gemini also asked a
+  follow-up question. Otherwise SQLite drifts from the sheet (2026-05-06
+  incident).
+- Never delete sheet rows before new rows are written. Use update-in-place
+  for same-count corrections, safe-replace (write-then-delete) for count
+  changes.
+- Drop unparseable `amount` field_updates with a WARNING log; NEVER store
+  `""` or other unparseable values (2026-05-07 incident).
+
+### State
+- All conversation state lives in SQLite. No in-memory dicts. Bot restarts
+  are instant — no reconstruction needed.
+- `conversations.user_id` is the original poster, used for @-mentions. Use
+  `main._resolve_user_id(conv, thread)` so legacy rows with NULL user_id
+  fall back to fetching the parent message's author and backfilling.
+- Audio is transcribed once and cached in `media_cache`. Never re-send raw
+  audio bytes to Gemini after the initial transcription.
+
+### Destructive actions
+- Retry-on-saved and delete-on-saved require an explicit confirmation via
+  a `pending_*_confirm` gate. Use `entry_manager._is_affirmative(text)`
+  for the confirmation check — it accepts `yes`, `yes!`, `Yes.`,
+  `yes please`, `yep`, etc.
+- The destructive-confirm prompts must @-mention the user — they touch
+  data and missing them is high-cost.
+
+### Memory safety (512mb VM)
+- Always preprocess images upfront via `gemini_processor.preprocess_images`
+  before the describe/extract phase; then `images.clear()` + `gc.collect()`
+  to free originals.
+- `PROCESSING_LOCK = asyncio.Semaphore(1)` wraps both message handlers —
+  burst posts queue rather than running in parallel.
+- Wrap every `generate_content` call in `asyncio.wait_for(..., 90)`.
+
+### Dedupe
+- An entry is a duplicate only when: amount equal within $0.01 AND date
+  **exactly** equal (no fuzziness) AND a client OR vendor name match
+  (substring). Do NOT match on type+category alone.
+- Bias: false negative (extra row to delete) > false positive (silently
+  dropped tax record).
+
+### Mentions
+- `_with_mention_if_needed(text, user_id, status)` for normal output.
+- Always-mention prompts: retry-confirm, delete-confirm, recovery reposts,
+  errors.
 
 ## Important Reminders
-- When changing the Pydantic models in `prompts.py`, also update the system prompt text
-  to match (they must stay in sync about categories, field meanings, etc.).
-- When changing the Google Sheet columns, update `sheets_manager.HEADERS` and
-  `sheets_manager._build_row()`.
-- After any architectural change, UPDATE `AGENTS.md` in the project root.
+- When changing Pydantic models in `prompts.py`, also update the system
+  prompt text — they must stay in sync about categories, field meanings,
+  intent classification, etc.
+- When changing the Google Sheet columns, update `sheets_manager.HEADERS`,
+  `_build_row()`, `_get_recent_entries_sync()`, AND `_get_rows_data_sync()`.
+- After any architectural change, UPDATE `AGENTS.md`. Add a row to the
+  "Recent incidents & learnings" table if you fixed a real-world bug.
 - Confidence is based on structured fields only (Date through Amount).
-  Description and Notes are best-effort and never lower confidence.
+  Description, Notes, and **Category** are best-effort and never lower
+  confidence (per explicit user preference — see AGENTS.md "Category
+  auto-pick").
 
 ## Deployment
 - Hosted on **Fly.io** (NOT Railway). See fly.toml and Dockerfile.
-- SQLite database stored on a Fly.io persistent volume mounted at `/data`.
-- Set `DB_PATH=/data/bot.db` in Fly.io secrets for production.
+- SQLite stored on a persistent volume mounted at `/data`.
+- Memory: `512mb` (NEVER revert to 256mb — a single 4MB image will OOM).
+- `DB_PATH=/data/bot.db` in Fly.io secrets.
+- Logs: `~/.fly/bin/flyctl logs --app musician-expenses-bot`.

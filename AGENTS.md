@@ -1,14 +1,16 @@
 # AGENTS.md — AI Agent Context for Musician Expense Tracker
 
-> This file provides context for AI coding agents (Cursor, Copilot, etc.)
-> working on this project. **Update this file when making architectural changes.**
+> Context for AI coding agents (Cursor, Copilot, etc.) working on this project.
+> **Update this file when making architectural changes.** Lighter conventions
+> also live in `.cursor/rules/project.mdc` — keep both files coherent.
 
-## What This Project Does
+## What this is
 
-A Discord bot that helps a musician/music teacher track income and expenses for taxes.
-She sends photos of receipts, text descriptions, or voice messages to a Discord channel.
-The bot uses Google Gemini to extract financial data, auto-saves high-confidence entries
-to a Google Sheet, and asks clarifying questions in a Discord thread when unsure.
+A Discord bot that helps a musician/music teacher track income and expenses
+for taxes. She sends photos of receipts, text descriptions, or voice messages
+to a Discord channel. The bot uses Google Gemini to extract financial data,
+auto-saves high-confidence entries to a Google Sheet, and asks clarifying
+questions in a Discord thread when uncertain.
 
 ## Architecture
 
@@ -34,271 +36,407 @@ Discord Channel ──message──▶ main.py (thin dispatcher)
               prompts.py (system prompts + Pydantic models)
 ```
 
-### Data Flow — New Entry
-1. User sends message → main.py downloads attachments, creates thread
-2. entry_manager.create_entry() orchestrates everything:
-   - Transcribes audio via Gemini (cached in SQLite, never re-sent as bytes)
-   - Describes images via Gemini (cached in SQLite for followup corrections)
-   - Extracts financial data via Gemini (images sent as bytes for accuracy)
-   - Stores conversation state in SQLite
-   - If confident: saves to Google Sheet, returns "saved" result
-   - If uncertain: returns "needs clarification" result with questions
-3. main.py posts the response in the thread and sets emoji
+### Data flow — new entry (main channel post)
 
-### Data Flow — Thread Reply (Correction)
-1. User replies in thread → main.py downloads any new attachments
-2. entry_manager.process_reply() orchestrates:
- - Loads conversation state from SQLite (instant, no re-downloading)
- - If conversation is missing (orphan from OOM): returns status=`retry_orphan`
- - If status is `pending_retry_confirm`: routes to "confirm destructive retry" gate
- - If confirmation word: saves existing entries to sheet
- - If new media: full extraction of new content only
- - If text correction: **field-level update** via Gemini (NOT full re-extraction)
- - Gemini ALSO classifies retry intent (`is_retry_request`); if true, returns
- status=`retry_active` (or `retry_needs_confirm` if entry is already saved)
- - Gemini identifies ONLY the fields to change
- - Unchanged fields stay locked (no regression)
- - Updates sheet in-place (no delete-then-append)
-3. main.py posts response and updates emoji
-4. If status is one of the retry_* family, main.py routes to `_handle_retry()`
- which fetches the parent message and re-runs `entry_manager.create_entry()`
- against it in the same thread (after deleting saved sheet rows on confirmed
- destructive retries).
+1. `main.handle_new_entry` adds ⏳ to the user's message, acquires the
+   `PROCESSING_LOCK` semaphore (one in-flight at a time), downloads attachments,
+   creates a thread, captures `message.author.id`.
+2. `entry_manager.create_entry` orchestrates:
+   - Transcribes audio (cached in SQLite — never re-sent as bytes).
+   - **Preprocesses images upfront** via `gemini_processor.preprocess_images`
+     (resize to ≤1600px JPEG), frees originals via `images.clear()` + `gc.collect()`.
+   - Describes resized images via Gemini (cached in SQLite).
+   - Extracts financial data via Gemini (also resized images).
+   - Stores conversation in SQLite with the original poster's `user_id`.
+   - If confident: dedupe-check, then save to Google Sheet → `status=saved`.
+   - If uncertain: → `status=pending_clarification` with questions.
+3. `main.handle_new_entry` posts the response (`@`-mentioning the poster
+   if the status needs action), sets emoji on user's message and parent.
 
-## Key Decisions and Rationale
+### Data flow — thread reply (correction / retry / delete / confirm)
 
-| Decision | Choice | Why |
-|----------|--------|-----|
-| Chat platform | Discord | Free, excellent thread support for tracking conversations per entry |
-| LLM | Gemini 3 Flash | Multimodal (vision+audio+text), thinking/reasoning, cheap, free tier |
-| Data store | Google Sheets | User wanted spreadsheet for taxes, easy to share with accountant |
-| Local state | SQLite (aiosqlite) | Persistent across restarts, no external DB service needed |
-| Language | Python 3.11+ | Best Discord bot ecosystem (discord.py), good Google API support |
-| Hosting | Fly.io | Discord bots need persistent WebSocket; Fly.io supports volumes for SQLite |
-| Sheets auth | Service account | No OAuth flow needed, just share sheet with service account email |
-| Structured output | Pydantic + response_schema | Forces Gemini to return valid JSON matching our schema |
-| Auto-confirm | Yes, at high confidence | Reduces friction — user doesn't have to type "yes" every time |
-| Corrections | Field-level updates | Prevents regression of already-correct fields |
-| Sheet updates | In-place update | Prevents data loss from delete-before-write pattern |
-| Audio | Transcribe once, cache | Avoids re-sending slow audio bytes on every followup |
-| Image preprocessing | Resize to ≤1600px before Gemini | Cuts a 4K phone photo from ~3MB to ~300KB — keeps the 256MB Fly VM out of OOM territory |
-| Message concurrency | `asyncio.Semaphore(1)` | One in-flight extraction at a time. Burst posts get queued; users see ⏳ but no OOM kill |
-| Gemini call hang protection | `asyncio.wait_for(..., 90s)` per attempt | Prevents silent infinite hangs from leaving the hourglass forever |
-| Startup recovery | Repost stuck bot responses | If bot died between `db.add_message` and `thread.send`, on restart it reposts the saved reply with a "I crashed earlier" prefix |
+1. `main.handle_thread_reply` adds ⏳, acquires the semaphore, pre-loads the
+   conversation's `user_id` (with backfill via `_resolve_user_id` for legacy rows).
+2. `entry_manager.process_reply`:
+   1. If conv is **None** (orphan thread, usually OOM-killed before save):
+      return `retry_orphan`.
+   2. If conv status is **`deleted`**: refuse politely → `deleted_ack`.
+   3. If text is a skip/discard word and not in a pending-confirm state: mark
+      `skipped` and stop.
+   4. If text is **affirmative** (`yes`, `yep`, `yes!`, etc.) and not in a
+      pending-confirm state: save via `_confirm_and_save`.
+   5. If conv status is **`pending_retry_confirm`**: affirmative → `retry_confirmed`;
+      anything else → revert to `saved` and post cancellation.
+   6. If conv status is **`pending_delete_confirm`**: same pattern → `delete_confirmed`
+      or revert.
+   7. Otherwise → Gemini correction call. Gemini classifies into one of four:
+      - `is_retry_request` → `retry_active` (or `retry_needs_confirm` if saved)
+      - `is_delete_request` → `delete_needs_confirm` (saved) or marks `deleted` immediately (unsaved)
+      - `is_confirmation` → save
+      - Otherwise: apply `field_updates`, ask any `remaining_questions`.
+3. **For already-saved entries with field updates**, the sheet is updated
+   in-place IMMEDIATELY (even if there are remaining clarifying questions).
+   Prevents the SQLite-vs-sheet drift that bit us on 2026-05-06.
+4. `main` routes the result:
+   - `retry_*` → `_handle_retry` (fetches parent, deletes conv, re-runs `create_entry`)
+   - `delete_*` → `_handle_delete` (deletes sheet rows, marks conv `deleted`)
+   - `deleted_ack` → just acknowledge, don't touch parent emoji
+   - Everything else → post response (mention if action needed), update emojis
 
-## File Responsibilities
+## State and contracts
+
+### Pydantic models (`prompts.py`)
+
+| Model | Purpose |
+|-------|---------|
+| `FinancialEntry` | Single income/expense row. Fields: date, type, category, client_or_event, vendor, mode_of_payment, amount, description, notes. |
+| `ExtractionResult` | First-pass output: `entries`, `confidence`, `clarifying_questions`, `raw_summary`. |
+| `FieldUpdate` | A targeted change to one field on one entry, with `reasoning`. |
+| `FollowupResult` | Thread-reply output: `field_updates`, `remaining_questions`, `is_confirmation`, `is_retry_request`, `is_delete_request`. The boolean flags are **mutually exclusive** — at most one is true. When in doubt, all false (correction). |
+
+### `ProcessingResult.status` values (entry_manager → main.py)
+
+| Status | Meaning | Mention on output? |
+|---|---|---|
+| `saved` | Entries written to sheet | no |
+| `skipped` | User discarded the entry, nothing written | no |
+| `pending_clarification` | Bot asked a question, waiting for user | **yes** |
+| `error` | Caught exception with a user-facing message | **yes** |
+| `retry_orphan` | No conv row exists; main.py should retry from parent | (handled by `_handle_retry`) |
+| `retry_active` | User explicitly asked retry on unsaved/safe conv | (handled by `_handle_retry`) |
+| `retry_needs_confirm` | User asked retry on saved entry — needs `yes` first | (handled by `_request_retry_confirmation`) |
+| `retry_confirmed` | User just confirmed a destructive retry | (handled by `_handle_retry`) |
+| `delete_needs_confirm` | User asked delete on saved entry — needs `yes` first | (handled by `_request_delete_confirmation`) |
+| `delete_confirmed` | User just confirmed a destructive delete | (handled by `_handle_delete`) |
+| `deleted_ack` | Reply in already-deleted thread, polite refusal | no (don't touch parent emoji) |
+
+### `conversations.status` values (db.py)
+
+| Status | Meaning |
+|---|---|
+| `pending_clarification` | Initial state; bot is asking questions OR was OOM-killed mid-pipeline |
+| `saved` | Entries are on the sheet |
+| `skipped` | User discarded; nothing on the sheet |
+| `deleted` | User confirmed delete; sheet rows removed |
+| `pending_duplicate_review` | All entries flagged as duplicates; awaiting "yes" or "skip" |
+| `pending_retry_confirm` | User asked retry on saved entry; awaiting "yes" |
+| `pending_delete_confirm` | User asked delete on saved entry; awaiting "yes" |
+
+### Emoji reactions
+
+| Emoji | Meaning | Set by |
+|---|---|---|
+| ⏳ | Bot is processing | `handle_new_entry`, `handle_thread_reply` |
+| ✅ | Entry saved to sheet (or reply acknowledged) | post-processing in main.py |
+| 💬 | Waiting for user input | post-processing when status is pending |
+| ❌ | Caught error | exception handlers |
+| ❓ | Message had no extractable content | `_handle_new_entry_locked` |
+| 🗑️ | Entries were deleted by the user | `_handle_delete` |
+
+`set_reaction` (main.py) blind-removes all known bot emojis before adding
+the new one — it does NOT rely on `message.reactions` cache (which can be
+stale on slow operations and was leaving 🪟+✅ alongside each other on
+retries).
+
+## Critical contracts
+
+These are invariants that future changes MUST preserve.
+
+### Sheet ↔ SQLite consistency
+
+The Google Sheet is the user-facing source of truth; SQLite is the bot's
+view. Two mechanisms keep them in sync:
+
+1. **Eager sheet sync on corrections to saved entries** (`entry_manager.process_reply`):
+   when a thread reply triggers `field_updates` on an already-saved conversation,
+   `update_entry_in_place` runs immediately — even if Gemini also asked a
+   follow-up question. Previously the sheet only updated when all questions
+   were resolved, which caused drift (see 2026-05-06 incident).
+2. **Live preview for destructive prompts** (`_request_delete_confirmation`):
+   the delete confirmation reads `sheets_manager.get_rows_data()` — the
+   actual current sheet contents — for its preview. So any other source of
+   drift (manual sheet edits, race conditions) can't mislead the user about
+   what's about to be deleted. Falls back to SQLite preview if the live
+   fetch fails.
+
+### Duplicate detection (`entry_manager._find_duplicates`)
+
+An extracted entry is a duplicate of a recent sheet row **only when all
+three** hold:
+
+1. Amount equal within $0.01.
+2. Date **exactly** equal (same calendar day).
+3. A **name match** — same client/event OR same vendor (substring either way,
+   case-insensitive).
+
+Iteration history:
+
+- Originally also matched on `type+category` alone → dropped real income
+  because different students paying the same rate on adjacent days were
+  collapsed. **Removed.**
+- Originally allowed `±1 day` on the date → collapsed weekly recurring
+  payments from the same client. **Removed** — bank texts and check dates
+  are reliable; the OCR-error scenario this guarded was theoretical.
+
+The bias is intentional:
+
+- **False negative** (a real duplicate slips through) → user deletes the
+  extra row. Low cost.
+- **False positive** (a real entry silently dropped) → missing tax record
+  the user may never notice. High cost.
+
+Every dedupe match is logged at INFO with `op=dedupe_match` plus matched
+fields. Tests: `.investigation/test_dedupe.py`.
+
+### Memory safety (512MB Fly VM)
+
+The bot runs on `shared-cpu-1x:512mb` (bumped from 256mb on 2026-05-18
+after two OOMs on legitimate 4MB phone photos). Code mitigations stay in
+place regardless:
+
+- **`Pillow draft()` mode** in `_resize_image_sync` — asks libjpeg for a
+  lower-resolution decode directly, cutting peak memory by ~50% versus
+  full-res decode + downscale. Intermediate BytesIO closed in `finally`.
+- **Upfront image preprocessing** (`preprocess_images`): `entry_manager`
+  resizes ALL images at the top of `create_entry` / `process_reply`, then
+  `images.clear()` + `gc.collect()` to free the multi-MB originals BEFORE
+  describe/extract runs.
+- **Serialised processing** (`PROCESSING_LOCK` = `asyncio.Semaphore(1)`):
+  one in-flight extraction at a time. Hourglass is set BEFORE acquiring
+  the lock so queued users still see feedback.
+- **Gemini timeout** (`GEMINI_CALL_TIMEOUT = 90s`): every `generate_content`
+  call is wrapped in `asyncio.wait_for(..., 90)`. Timeouts are retried.
+- **Startup recovery** (`main.recover_stuck_conversations`): if the bot
+  died between `db.add_message` and `thread.send`, the conv row has
+  `created_at == updated_at` and the response text is in `conversation_messages`.
+  On `on_ready`, scan for these, repost the saved response with a "I crashed
+  earlier" prefix, flip parent emoji to 💬, `db.touch_conversation` so we
+  don't double-post. Capped at `RECOVERY_MAX_AGE_DAYS = 30`.
+- **`!recover` admin command** ignores the age cap for one-off recoveries.
+
+**Bump triggers (512mb → 1024mb)** — bump memory if any become true:
+
+- Another `exit_code=137` event in `flyctl machine status`
+- Idle Python RSS creeps above ~200MB (baseline was ~106MB)
+- We add PDF support (PDFs can be 5–20MB; Pillow can't shrink them)
+- We bump `PROCESSING_LOCK` above semaphore(1)
+- Workload shifts to multi-image messages (each 4MB image still spikes ~50MB)
+
+**Never revert to 256MB** — a single 4MB image is enough to OOM there.
+
+### @-mentions on input-needed prompts
+
+Whenever the bot sends a prompt that needs user action, it prefixes the
+message with a Discord `<@user_id>` mention of the **original poster**
+(captured at thread creation, stored on `conversations.user_id`). The
+mapping is driven by `ProcessingResult.status`:
+
+- `status == "pending_clarification"` → mention
+- `status == "error"` → mention
+- All other statuses → no mention
+
+In addition, **three special prompts always mention** regardless of status,
+because they're high-stakes:
+
+- `_request_retry_confirmation` (touches the spreadsheet)
+- `_request_delete_confirmation` (touches the spreadsheet)
+- `recover_stuck_conversations` (may be hours/days old)
+
+For **legacy conversation rows** with `user_id IS NULL` (created before the
+column existed), `_resolve_user_id()` falls back to fetching the parent
+message via Discord API and using `parent.author.id`, then backfills the
+DB via `db.set_user_id()` so the cost is paid at most once per thread.
+
+In the retry path, `_handle_retry` uses `parent.author.id` so a fresh
+conversation row is associated with the right person even if a different
+user typed "retry".
+
+## User-facing features
+
+### Auto-recovery on startup
+
+See [Memory safety](#memory-safety-512mb-fly-vm) above. Run admin manually
+via `!recover [max_age_days]` from any monitored channel (owner-only).
+
+### Natural-language retry
+
+User says "retry this" / "try again" / "reprocess" / etc. in a thread. Gemini
+classifies via `FollowupResult.is_retry_request`.
+
+- **Orphan threads** (no SQLite conv): ANY reply triggers retry — only useful action.
+- **Active threads** (conv exists, not saved): retry immediately.
+- **Saved entries** (sheet rows exist): `pending_retry_confirm` gate; user
+  must explicitly type `yes`. Any other reply cancels and reverts to `saved`.
+
+Orchestrator: `main._handle_retry`. Fetches parent, deletes existing conv,
+calls `create_entry` in same thread.
+
+### Natural-language delete
+
+User says "delete this" / "remove this entry" / "scratch this" / etc.
+Gemini classifies via `FollowupResult.is_delete_request`. Distinguished
+from corrections by explicit prompt examples ("change amount to 0" is a
+correction, not delete; "remove the description" is a correction).
+
+- **Unsaved entries**: no confirmation; mark `deleted`, post 🗑️ message.
+- **Saved entries**: `pending_delete_confirm` gate with a **live sheet preview**;
+  user types `yes`. Any other reply cancels.
+- **After delete**: parent emoji → 🗑️, conv `status=deleted`, further replies
+  in the thread get a polite refusal (`deleted_ack`).
+- **No undo by design**: user can use `retry` to re-extract from the parent
+  if they deleted by mistake (Gemini may give slightly different output).
+
+Orchestrator: `main._handle_delete`. Uses `sheets_manager.delete_rows()`.
+
+### Category auto-pick (no clarification questions)
+
+By explicit user request, Gemini **never** asks the user to disambiguate
+Teaching vs Performance — it picks one. Defaults: **Teaching** for income
+(her dominant source) and **Teaching** for expense (covers studio rent,
+materials, repairs). "Performance" or "IT" only when context clearly
+indicates them. Category ambiguity must NOT lower extraction confidence
+either, so it doesn't block auto-save. See `CATEGORY RULES` in
+`EXTRACTION_SYSTEM_PROMPT` and rule #4 in `CORRECTION_SYSTEM_PROMPT`.
+
+A wrong category is trivial to correct in-thread; a blocking clarification
+is friction the user explicitly asked us to avoid.
+
+### `_is_affirmative` parsing
+
+User confirmations accept variations: `yes`, `yes!`, `Yes.`, `yes please`,
+`yep`, `yeah`, `confirm`, `ok`, `y`. The helper strips trailing punctuation
+and accepts the first word of short multi-word replies. **It does NOT**
+match "yes but the amount is wrong" (too long, has substantive content) —
+that falls through to Gemini for proper correction handling.
+
+## Reference
+
+### File responsibilities
 
 | File | Purpose |
 |------|---------|
-| `main.py` | Discord event dispatcher. Downloads attachments, manages emoji, creates threads. Thin — all logic delegated to entry_manager. |
-| `entry_manager.py` | Entry lifecycle orchestration. Creates entries, processes corrections, confirms, saves. Coordinates db + gemini + sheets. |
-| `gemini_processor.py` | Gemini API integration. Transcribes audio, describes images, extracts financial data, processes field-level corrections. |
-| `sheets_manager.py` | Google Sheets CRUD. Append, update-in-place, safe-replace. Each channel maps to its own tab (e.g. "Entries", "Test Entries"). Sync gspread wrapped in asyncio.to_thread(). |
-| `db.py` | SQLite persistence. Conversations (entry state), media_cache (transcriptions/descriptions), conversation_messages (thread history). |
-| `prompts.py` | System prompts + Pydantic models. FinancialEntry, ExtractionResult (initial), FieldUpdate, FollowupResult (corrections). Tightly coupled with prompts. |
-| `config.py` | Environment variable loading + logging setup. |
+| `main.py` | Discord event dispatcher. Downloads attachments, manages emoji, creates threads, orchestrates retry/delete flows. Thin — extraction logic lives in entry_manager. |
+| `entry_manager.py` | Entry lifecycle. Creates entries, processes corrections, runs dedupe, coordinates DB + Gemini + sheets. The central coordinator. |
+| `gemini_processor.py` | Gemini API. Transcribe audio, describe images, extract financial data, process field-level corrections. Image resize + preprocessing. Retry + timeout wrapping. |
+| `sheets_manager.py` | Google Sheets CRUD. Append, update-in-place, safe-replace, delete-rows, get-rows-data. Sync `gspread` wrapped in `asyncio.to_thread`. |
+| `db.py` | SQLite via `aiosqlite`. Conversations (entry state + tab_name + user_id), media_cache (transcriptions/descriptions), conversation_messages (thread history). |
+| `prompts.py` | System prompts + Pydantic models. Tightly coupled — change prompts and schemas together. |
+| `config.py` | Env var loading, logging setup, channel→tab map. |
 | `Dockerfile` / `fly.toml` | Fly.io deployment configuration with persistent volume for SQLite. |
 
-## Spreadsheet Schema ("Entries" tab)
+### Spreadsheet schema ("Entries" tab)
 
 | Column | Description |
 |--------|-------------|
 | Date | YYYY-MM-DD |
 | Type | Income or Expense |
-| Category | Income: Teaching, Performance / Expense: IT, Performance, Teaching |
-| Client/Event | Income only: student name or paying organization |
+| Category | Income: Teaching, Performance · Expense: IT, Performance, Teaching |
+| Client/Event | Income only: student or paying organization |
 | Vendor | Expense only: who was paid |
 | Mode of Payment | Income only: Venmo, Zelle, Check, or Other |
 | Amount ($) | Dollar amount |
 | Description | Freeform — what this item is |
 | Notes | Freeform — extra context (1099/W-2, late payment, etc.) |
-| Discord Link | Link to the Discord thread for this entry |
+| Discord Link | Link to the originating Discord message |
 | Timestamp | When the row was added |
 
-## Multi-Channel Routing
-
-Each Discord channel maps to its own sheet tab via `CHANNEL_TAB_MAP` in `config.py`:
-- `PROD_CHANNEL_ID` -> "Entries" tab (production)
-- `TEST_CHANNEL_ID` -> "Test Entries" tab (testing)
-
-The tab name is stored in the SQLite `conversations` table so that thread replies
-automatically route to the correct tab without needing the channel ID again.
-
-## SQLite Schema (db.py)
+### SQLite schema
 
 | Table | Purpose |
 |-------|---------|
-| conversations | Entry state: thread_id, entries JSON, confidence, status, sheet row numbers, tab_name |
-| media_cache | Cached transcriptions (audio) and descriptions (images) by message_id |
-| conversation_messages | Full thread history (role + content) for Gemini context in corrections |
+| `conversations` | Entry state. Columns: thread_id, message_url, original_text, status, entries_json, confidence, questions_json, raw_summary, sheet_rows_json, tab_name, **user_id**, created_at, updated_at. |
+| `media_cache` | Cached transcriptions (audio) and descriptions (images) by message_id. |
+| `conversation_messages` | Full thread history (role + content) for Gemini context in corrections. |
 
-## Emoji Reactions Guide
+### Multi-channel routing
 
-| Emoji | Meaning |
-|-------|---------|
-| ⏳ | Bot is processing |
-| ✅ | Entry saved to spreadsheet |
-| 💬 | Waiting for user input/clarification |
-| ❌ | Actual error (API failure, crash) |
+Each Discord channel maps to its own sheet tab via `CHANNEL_TAB_MAP` in
+`config.py`:
 
-## Environment Variables
+- `PROD_CHANNEL_ID` → "Entries" tab
+- `TEST_CHANNEL_ID` → "Test Entries" tab
+
+The tab name is stored on the SQLite conversation so replies route
+automatically without re-checking the channel.
+
+### Environment variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `DISCORD_TOKEN` | Yes | Bot token from Discord Developer Portal |
-| `PROD_CHANNEL_ID` | Yes | Production channel ID -> "Entries" tab |
-| `TEST_CHANNEL_ID` | No | Testing channel ID -> "Test Entries" tab |
+| `PROD_CHANNEL_ID` | Yes | Production channel ID → "Entries" tab |
+| `TEST_CHANNEL_ID` | No | Testing channel ID → "Test Entries" tab |
 | `GEMINI_API_KEY` | Yes | API key from Google AI Studio |
-| `SPREADSHEET_ID` | Yes | Google Sheet ID (or full URL — auto-extracted) |
+| `SPREADSHEET_ID` | Yes | Google Sheet ID (full URL also accepted — auto-extracted) |
 | `GOOGLE_CREDENTIALS_JSON` | Yes | Service account creds (JSON string or file path) |
-| `GEMINI_MODEL` | No | Model name (default: `gemini-3-flash-preview`) |
-| `CONFIDENCE_THRESHOLD` | No | Min confidence for auto-confirm (default: `0.8`) |
-| `DB_PATH` | No | SQLite database path (default: `./bot.db` locally, set to `/data/bot.db` on Fly.io) |
+| `GEMINI_MODEL` | No | Default `gemini-3-flash-preview` |
+| `CONFIDENCE_THRESHOLD` | No | Default `0.8` |
+| `DB_PATH` | No | Default `./bot.db` locally; set `/data/bot.db` on Fly.io |
 
-## Deployment (Fly.io)
+### Deployment (Fly.io)
 
-The bot runs on Fly.io with a persistent volume for the SQLite database.
+```
+fly volumes create bot_data --region lax --size 1   # one-time
+fly secrets set DB_PATH=/data/bot.db                # one-time
+fly deploy                                          # each time
+```
 
-- `fly.toml` — App config with `[mounts]` for the `/data` volume
-- `Dockerfile` — Python 3.11-slim, creates `/data` directory
-- Volume must be created once: `fly volumes create bot_data --region lax --size 1`
-- Set `DB_PATH=/data/bot.db` in Fly.io secrets
-- Deploy: `fly deploy`
+Watch deploy + recovery in real time:
 
-## Common Tasks
-
-### Adding a new category
-Edit the category lists in `prompts.py` (both in `FinancialEntry.category` field description
-and in `EXTRACTION_SYSTEM_PROMPT` and `CORRECTION_SYSTEM_PROMPT`).
-
-### Category disambiguation policy
-By explicit user request, Gemini must **never** ask the user to disambiguate
-Teaching vs Performance — it picks one. Defaults: **Teaching** for income
-(her dominant source) and **Teaching** for expense (covers studio rent,
-materials, repairs, etc.). "Performance" or "IT" only when context clearly
-indicates them. Category ambiguity must NOT lower extraction confidence
-either, so it doesn't block auto-save. See `CATEGORY RULES` in
-`EXTRACTION_SYSTEM_PROMPT` and rule #4 in `CORRECTION_SYSTEM_PROMPT`. The
-trade-off is intentional: a wrong category is trivial to correct in-thread;
-a blocking clarification is friction the user explicitly asked us to avoid.
-
-### Changing the LLM model
-Set the `GEMINI_MODEL` env var. No code changes needed.
-
-### Adding a new command
-Add a `@bot.command()` function in `main.py`, following the pattern of existing commands.
-
-### Adding a new column to the spreadsheet
-1. Add the column name to `HEADERS` in `sheets_manager.py`
-2. Update `_build_row()` in `sheets_manager.py`
-3. If it comes from Gemini, add it to the `FinancialEntry` Pydantic model in `prompts.py`
-4. Update `_format_entry()` in `entry_manager.py` to display the new field
-
-## Duplicate detection contract (`entry_manager._find_duplicates`)
-
-An extracted entry is treated as a duplicate of a recent sheet row only when
-**all three** conditions hold:
-
-1. Amount equal within $0.01.
-2. Date **exactly** equal (same calendar day).
-3. A **name match** — same client/event OR same vendor (substring
- either way, case-insensitive).
-
-Design rationale (we've iterated twice):
-
-- We previously also matched on `type+category` alone. That dropped real
- income because different students paying the same rate on adjacent days
- were collapsed (the 2026-02-22 Guangling Li $240 incident). **Removed.**
-- We previously allowed `±1 day` on the date to catch receipt OCR errors.
- That collapsed weekly-recurring payments from the same client (e.g.
- Guangling Li sends $240 every Sunday — entries 7 days apart, but if one
- extraction lands on Saturday and another on Sunday, the ±1d window
- silently merged them). **Removed** — bank texts and check dates are
- reliable; the OCR-error scenario this guarded was theoretical.
-
-The bias is intentional:
-
-- **False negative tolerated** (a real duplicate row slips through) — user
- deletes it manually, low cost.
-- **False positive avoided** (a real entry silently dropped) — could mean
- missing tax records the user never notices, high cost.
-
-Dedupe matches are logged at INFO level with `op=dedupe_match` plus the
-matched fields, so future false positives are diagnosable from the logs
-without re-running the bot.
-
-Tests: `.investigation/test_dedupe.py` covers both historical incidents
-and is a good place to add new edge cases if/when they show up.
+```bash
+~/.fly/bin/flyctl logs --app musician-expenses-bot
+```
 
 ## Conventions
 
-- **Async everywhere**: The Discord bot is async. Use `await` for all I/O.
- gspread is sync, so it's wrapped with `asyncio.to_thread()`.
- SQLite uses aiosqlite (native async).
- Pillow (image resize) is CPU-bound, also wrapped with `asyncio.to_thread()`.
-- **Logging**: Use the `logging` module with structured context: `thread=X op=Y | message`.
- Timing: log elapsed time for Gemini calls and sheet operations.
-- **Type hints**: All function signatures should have type hints.
-- **Error handling**: Catch exceptions in event handlers, report to user via Discord, log the traceback.
-- **Confidence**: Only structured fields (Date through Amount) affect confidence.
- Description and Notes are best-effort and never trigger clarification.
-- **Corrections**: Use field-level updates (FollowupResult), NOT full re-extraction.
- Never delete sheet rows before new rows are written.
+- **Async everywhere**: bot is async. `await` for all I/O. `gspread` is sync,
+  wrap in `asyncio.to_thread()`. `Pillow` (CPU-bound), same. SQLite uses
+  native-async `aiosqlite`.
+- **Logging**: `logging` with structured context — `thread=X op=Y | message`.
+  Log elapsed time for Gemini calls and sheet ops. INFO for milestones
+  (`op=dedupe_match`, `op=resize`, `op=retry | Done`, etc.), WARNING for
+  recoverable oddities, ERROR (with traceback) for caught exceptions.
+- **Type hints**: all function signatures.
+- **Error handling**: catch exceptions in event handlers, report to user via
+  Discord, log the traceback. NEVER let an exception crash the bot loop.
+- **Confidence**: only structured fields (Date through Amount) affect
+  confidence. Description, Notes, and Category never lower it.
+- **Corrections**: field-level updates only (FollowupResult). Never re-extract.
+- **Saved entries**: sheet update mirrors SQLite immediately on every
+  correction (don't defer until questions are resolved).
+- **Destructive actions** (retry-on-saved, delete-on-saved): require an
+  explicit `_is_affirmative` confirmation via a pending-confirm gate.
+- **`amount` field updates**: drop them silently if unparseable. NEVER
+  store `""` — it makes the entry un-saveable (see 2026-05-07 incident).
+- **Imports**: stdlib → third-party → local.
 
-## Memory & Reliability Constraints (512MB Fly VM)
+## Common tasks
 
-The bot runs on a `shared-cpu-1x:512mb` Fly VM (bumped from 256mb on
-2026-05-18 after two OOMs on legitimate 4MB phone photos; the code-level
-mitigations below stay in place regardless). Several patterns exist to keep peak memory
-safely below the OOM ceiling and to recover gracefully when things go wrong:
+### Adding a new category
+1. Update `FinancialEntry.category` description in `prompts.py`.
+2. Update `EXTRACTION_SYSTEM_PROMPT` (`CATEGORY RULES`) in `prompts.py`.
+3. Update `CORRECTION_SYSTEM_PROMPT` in `prompts.py`.
+4. No code changes elsewhere.
 
-- **Image resize** (`gemini_processor.resize_image`): every image is downscaled
- to ≤1600px on its longest side and re-encoded as JPEG before being sent to
- Gemini. A 4K phone photo drops from ~3MB to ~300KB. Run in a thread pool
- because Pillow is CPU-bound. Failures fall back silently to original bytes.
- Uses Pillow's `draft()` to ask the JPEG decoder for a lower-resolution decode
- directly (libjpeg native scaling), cutting peak memory by ~50% versus full-res
- decode + downscale. The intermediate BytesIO is closed explicitly in a finally
- block.
-- **Upfront image preprocessing** (`gemini_processor.preprocess_images`):
- `entry_manager.create_entry` and `process_reply` call this AT THE TOP to
- resize every image once and immediately drop the original (multi-MB) bytes
- via `images.clear()` + `gc.collect()`. The describe/extract calls downstream
- then operate on ~300KB images, avoiding holding the large originals AND
- paying decode cost twice. This fix shipped after a 4MB phone photo OOM-killed
- the bot (incident 2026-05-18 05:04).
-- **Serialised processing** (`PROCESSING_LOCK` in main.py): a global
- `asyncio.Semaphore(1)` wraps both `handle_new_entry` and `handle_thread_reply`.
- Concurrent message bursts queue up rather than running in parallel. The
- hourglass emoji is set BEFORE acquiring the lock so the user has feedback.
-- **Eager byte cleanup** (`entry_manager.create_entry` /
- `entry_manager.process_reply`): image bytes are explicitly cleared and
- `gc.collect()` is called immediately after extraction so the working set
- shrinks back to baseline before the next message.
-- **Gemini timeout** (`gemini_processor.GEMINI_CALL_TIMEOUT`): every
- `generate_content` call is wrapped in `asyncio.wait_for(..., 90s)`.
- Timeouts are retried (with the same backoff as transient API errors).
-- **Startup recovery** (`main.recover_stuck_conversations`): if the bot died
- between `db.add_message` and `thread.send` (the OOM-kill window), the
- conversation row has `created_at == updated_at` and the response text is
- sitting in `conversation_messages`. On `on_ready` we scan for these,
- repost the saved bot response prefixed with ":pushpin: _I crashed before I
- could reply earlier..._", update the original message's emoji from ⏳ to 💬,
- and call `db.touch_conversation` so we don't double-post on the next restart.
- Capped at `RECOVERY_MAX_AGE_DAYS = 30` to avoid surprising the user with
- ancient messages.
+### Adding a new column to the spreadsheet
+1. Add column name to `HEADERS` in `sheets_manager.py`.
+2. Update `_build_row()` in `sheets_manager.py`.
+3. Add field to `FinancialEntry` Pydantic model in `prompts.py`.
+4. Update `_format_entry()` in `entry_manager.py` to render it.
+5. Update `_get_rows_data_sync` and `_get_recent_entries_sync` if needed.
 
-If the bot starts OOMing again despite the 512MB VM + these mitigations,
-the next step is bumping `fly.toml` from `'512mb'` to `'1024mb'`. Don't
-revert to 256MB even if it looks stable — a single 4MB image is enough to
-trigger an OOM there (see 2026-05-18 incidents in the log).
+### Adding a new bot command
+Add a `@bot.command()` function in `main.py` following the existing pattern.
+For admin-only commands use `@commands.is_owner()` (see `!recover`).
+
+### Changing the LLM model
+Set `GEMINI_MODEL` env var. No code changes.
 
 ### Memory monitoring
 
-- **Fly memory graph**: https://fly.io/apps/musician-expenses-bot/monitoring
-  (look for steady idle around 100–120MB; spikes during processing should
-  cap around 130–150MB)
-- **Recent OOM events** (any `exit_code=137`):
+- **Fly dashboard**: https://fly.io/apps/musician-expenses-bot/monitoring
+  (idle baseline ~106 MB, per-message peak ~150 MB on 512mb VM)
+- **Recent OOM events**:
   ```bash
   ~/.fly/bin/flyctl machine status 8e7d3df779e1d8 --app musician-expenses-bot | tail -20
   ```
@@ -313,129 +451,46 @@ trigger an OOM there (see 2026-05-18 incidents in the log).
     --app musician-expenses-bot
   ```
 
-**Bump triggers (512mb → 1024mb)** — bump memory if any of these become true:
-- Another `exit_code=137` event appears in `flyctl machine status`
-- Idle Python RSS creeps above ~200MB (was ~106MB on baseline)
-- We add PDF support (PDFs can be 5–20MB and Pillow can't shrink them)
-- We bump the processing semaphore above 1
-- Workload shifts to multi-image messages (each 4MB image still spikes ~50MB)
+### Running scripts against the live DB
 
-## @-mention contract (`main._with_mention_if_needed` / `_format_mention`)
+The `.investigation/` folder (gitignored) holds ad-hoc query scripts and
+unit tests used during incident investigation. Pattern for running a
+Python script against the live bot's environment:
 
-When the bot needs the user to take action (answer a clarifying question,
-confirm a destructive retry, see an error), it prefixes the message with a
-Discord `<@user_id>` mention of the **original poster** so they get a push
-notification on mobile/desktop.
+```bash
+~/.fly/bin/flyctl ssh sftp shell --app musician-expenses-bot <<EOF
+put .investigation/my_script.py /data/my_script.py
+EOF
+~/.fly/bin/flyctl machine exec 8e7d3df779e1d8 --app musician-expenses-bot \
+  --timeout 60 'python /data/my_script.py'
+```
 
-The mapping is intentionally driven by `ProcessingResult.status` (so the
-decision lives close to the semantics, not scattered across send sites):
+To pull a snapshot of `bot.db`:
 
-- `status == "pending_clarification"` → mention
-- `status == "error"` → mention
-- All other statuses (`saved`, `skipped`, `retry_*` intros) → no mention
+```bash
+~/.fly/bin/flyctl ssh sftp get /data/bot.db ./bot.db.snapshot --app musician-expenses-bot
+```
 
-In addition, **two special prompts always mention** regardless of status,
-because they're high-stakes and the cost of being missed is high:
+## Recent incidents & learnings
 
-- `_request_retry_confirmation` (touches the spreadsheet)
-- `recover_stuck_conversations` (the user may have posted this hours/days
- ago and is waiting on a reply)
+Real-world bugs we hit during the 2026-05-17 polish session, with the
+specific fixes. Useful for understanding *why* the code is shaped the way
+it is.
 
-The user_id is captured from `message.author.id` when `handle_new_entry`
-runs and stored on the `conversations.user_id` column. For **legacy conversation
-rows** (created before this column existed) or any row that has `user_id IS
-NULL`, the `_resolve_user_id()` helper falls back to fetching the parent
-message via Discord API and using `parent.author.id`, then backfills the DB
-via `db.set_user_id()` so the cost is paid at most once per thread. This way
-even old threads get correctly @-mentioned on the first prompt after restart.
+| Date | Symptom | Root cause | Fix |
+|------|---------|------------|-----|
+| 2026-05-03 | Multiple stuck threads showing only ⏳, no bot reply | Bot OOM-killed on 4MB phone photos; SIGKILL bypassed the exception handler | Image resize + semaphore + upfront preprocessing + startup recovery (reposts saved-but-undelivered responses) |
+| 2026-05-06 | Bot's "Updated 1 entry: amount 350 → 0" later showed $0 in a delete preview, but sheet still had $350 | Sheet only updated when no `remaining_questions`; SQLite drifted from sheet | Eager sheet sync on corrections to saved entries (regardless of remaining questions) |
+| 2026-05-07 | "Remove it entirely" silently corrupted the entry; future operations on it crashed | Gemini returned `""` for amount; the `except ValueError: pass` left it as `""`; `_build_row` crashed on `float("")` | Drop unparseable amount field_updates with a WARNING log instead of silently storing |
+| 2026-02-22 | $240 Guangling Li payment silently skipped as "duplicate" of $240 Reina and Angel | `_find_duplicates` matched on `type+category` alone (any income+Teaching at $240 on adjacent days collapsed) | Remove the `type_category_match` fallback; require client OR vendor name match |
+| 2026-03-15 / 03-21 | Weekly recurring $240 Guangling Li payments silently skipped | Date matching was "within 1 day"; consecutive-week entries 6-8 days apart collided when one date was extracted slightly off | Tighten date match to **exact**; bank texts and check dates are reliable |
+| 2026-05-18 | Long retries left ⏳ stuck alongside ✅ on the user's reply | `set_reaction` iterated `message.reactions` (stale cache during long ops) | Blind-remove all known bot emojis instead of trusting the cache |
+| 2026-05-18 | Hourglass on parent never updated to 💬 when bot asked for retry confirmation | `_request_retry_confirmation` didn't flip parent emoji | Call `_update_original_reaction` from the confirm helper |
+| 2026-05-18 | Replying "yes!" cancelled a destructive retry instead of confirming | `text_to_check in CONFIRM_WORDS` literal match didn't accept trailing punctuation | New `_is_affirmative()` helper that strips punctuation and accepts short multi-word forms |
+| 2026-05-18 | OOM persisted even after Pillow `draft()` and preprocessing fixes | Code-level mitigations got peak down from ~200MB to ~150MB, still right at 256MB ceiling | Bump VM to 512mb; ~$2/mo |
+| 2026-05-18 | "yes" in `pending_delete_confirm` crashed with `float("")` instead of deleting | Step-5 confirm fast-path excluded `pending_retry_confirm` but not `pending_delete_confirm` — routed "yes" to save path instead of delete gate | Exclude all pending-confirm statuses from both step-4 (skip) and step-5 (confirm) fast-paths |
+| 2026-05-18 | Confirmation prompts didn't @-mention on legacy threads (created pre-`user_id` column) | `conv.user_id` was NULL → `_format_mention(None)` returned `""` | `_resolve_user_id()` with fetch-and-backfill fallback |
 
-In the retry path, when create_entry runs on the parent message, we use
-`parent.author.id` so a fresh conversation row is associated with the right
-person, even if a different user typed "retry".
-
-## Sheet ↔ SQLite consistency
-
-SQLite holds the bot's view of conversations; the Google Sheet is the
-user-facing source of truth. Two mechanisms keep them in sync:
-
-1. **Eager sheet sync on corrections to saved entries** — when a thread
- reply triggers `field_updates` and the conversation is already saved
- (`sheet_row_numbers` populated), `entry_manager.process_reply` mirrors
- the change to the sheet immediately via `update_entry_in_place()` — even
- if Gemini also asked a follow-up clarifying question. This prevents drift
- where SQLite has the latest correction but the sheet still shows the old
- value. Motivating incident: 2026-05-06 "amount: 350 → 0" correction
- followed by a clarifying question — the sheet kept $350 and SQLite kept
- $0 until a later delete confirmation exposed the inconsistency.
-
-2. **Live preview for destructive prompts** — `_request_delete_confirmation`
- calls `sheets_manager.get_rows_data()` to display the *actual current
- sheet contents*, not the SQLite state. This way any source of drift
- (manual sheet edits, race conditions, future bugs) can't mislead the user
- about what's about to be deleted. Falls back to SQLite preview gracefully
- if the live fetch fails.
-
-## Natural-language delete
-
-The user can ask the bot to remove an entry from the spreadsheet using free-form
-language ("delete this", "remove this entry", "scratch this", "get rid of it",
-etc.). Detection strategy parallels the retry feature:
-
-- **Gemini classifies** the reply via `FollowupResult.is_delete_request`. The
- prompt teaches it to distinguish:
-   - "delete this" → DELETE
-   - "change amount to 0" → CORRECTION (field update, not delete)
-   - "remove the description" → CORRECTION (description field → empty)
-   - "delete the wrong amount, it was $50" → CORRECTION
-- **Unsaved entries** (status=`pending_clarification`, no sheet rows): no
- confirmation needed; conv is marked `deleted` and a 🗑️ "discarded" message
- is posted.
-- **Saved entries** (status=`saved` with sheet rows): a confirmation gate
- (status=`pending_delete_confirm`) protects against accidental loss. The
- prompt shows a preview of the entries to be deleted and waits for explicit
- `yes`. Any other reply cancels and reverts to `saved`.
-- **No undo** by design — if the user deletes by mistake, they can use
- `retry` to re-extract from the parent message (Gemini may return slightly
- different output) or manually re-add to the sheet.
-
-Delete orchestration lives in `main._handle_delete()` (similar to
-`_handle_retry`). It calls `sheets_manager.delete_rows()` to remove the rows,
-updates the conversation row to `status='deleted'`, posts a 🗑️ confirmation,
-and flips the parent message's emoji from ✅ to 🗑️.
-
-After deletion, **replies in the same thread are politely refused** with
-"This entry was deleted. To create a new one, send a fresh message in the
-main channel." Uses a dedicated `deleted_ack` status so main.py knows to
-acknowledge the user's message (✅ on their reply) but leave the parent's
-🗑️ alone.
-
-The mention contract applies: the confirmation prompt always @-mentions
-(high-stakes), the post-delete message and refusal don't (no further action
-needed from the user).
-
-## Natural-language retry
-
-Inside a thread, the user can ask the bot to **re-extract from the original
-parent message** using free-form language ("retry this", "reprocess", "try
-again from scratch", "this is mangled, do it over", etc.). Detection
-strategy:
-
-- **Orphan threads** (no SQLite conversation row, typically because an OOM
- killed the bot before `db.create_conversation`): ANY reply triggers retry —
- it's the only useful thing we can do. Handled in `entry_manager.process_reply`
- by returning `status='retry_orphan'`.
-- **Active threads** (conversation exists): Gemini classifies the reply via a
- new `FollowupResult.is_retry_request` bool. Field-level corrections like
- "change amount to $400" stay as corrections; phrases like "try again" or
- "this is wrong, redo it" become retries.
-- **Saved entries** (sheet rows exist): a confirmation gate (`pending_retry_confirm`
- status) protects against accidental destructive retries. The bot tells the
- user how many sheet rows would be deleted and waits for explicit "yes". Any
- other reply cancels and reverts to saved.
-
-Retry orchestration lives in `main._handle_retry()` because it needs Discord
-context (fetching the parent message via `bot.fetch_channel` →
-`channel.fetch_message(thread.id)`). It deletes any existing conversation
-row + chat history (`db.delete_conversation`) and calls
-`entry_manager.create_entry()` against the parent message inside the
-existing thread, then posts the result and updates the parent emoji.
+The dedupe tests in `.investigation/test_dedupe.py` and `_is_affirmative`
+tests in `.investigation/test_affirmative.py` lock in the fixes for the
+top items. Add a test there if you fix a future false-positive case.
