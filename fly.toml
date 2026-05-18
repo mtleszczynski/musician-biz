@@ -12,7 +12,13 @@ primary_region = 'lax'
 
 [[vm]]
   size = 'shared-cpu-1x'
-  memory = '256mb'
+  # Bumped from 256mb -> 512mb on 2026-05-18 after two OOM incidents on
+  # legitimate 4MB phone photos. Even with all code-level mitigations in place
+  # (image resize w/ draft mode, upfront preprocessing, semaphore, gc.collect,
+  # Gemini timeouts), peak RSS during JPEG decode was consistently ~150MB,
+  # right at the 256MB kernel OOM cliff. 512mb gives ~3x headroom for normal
+  # use and absorbs multi-image messages without risk.
+  memory = '512mb'
   auto_stop_machines = 'off'
 
 [deploy]

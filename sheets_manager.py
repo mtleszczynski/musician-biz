@@ -283,6 +283,50 @@ def _get_recent_entries_sync(days: int = 90, tab_name: str = "Entries") -> list[
     return results
 
 
+def _get_rows_data_sync(
+    row_numbers: list[int], tab_name: str = "Entries",
+) -> list[dict]:
+    """Fetch entry data for specific row numbers, returning entry-shaped dicts.
+
+    Used by the delete confirmation prompt to display the *actual* current
+    sheet contents rather than the (potentially stale) SQLite state. Rows
+    that no longer exist or can't be parsed return as None entries in the
+    list at their position.
+    """
+    if not row_numbers:
+        return []
+    worksheet = _get_entries_worksheet(tab_name)
+    all_values = worksheet.get_all_values()
+    results: list[dict] = []
+    for row_num in row_numbers:
+        # all_values is 0-indexed; sheet row numbers are 1-indexed.
+        idx = row_num - 1
+        if idx < 0 or idx >= len(all_values):
+            results.append({"row_number": row_num, "missing": True})
+            continue
+        row = all_values[idx]
+        if len(row) < 7:
+            results.append({"row_number": row_num, "missing": True})
+            continue
+        try:
+            amount = float((row[6] or "").replace("$", "").replace(",", ""))
+        except ValueError:
+            amount = 0.0
+        results.append({
+            "date": row[0],
+            "type": (row[1] or "").lower(),
+            "category": row[2] if len(row) > 2 else "",
+            "client_or_event": row[3] if len(row) > 3 else "",
+            "vendor": row[4] if len(row) > 4 else "",
+            "mode_of_payment": row[5] if len(row) > 5 else "",
+            "amount": amount,
+            "description": row[7] if len(row) > 7 else "",
+            "notes": row[8] if len(row) > 8 else "",
+            "row_number": row_num,
+        })
+    return results
+
+
 def _get_monthly_summary_sync(month: int, year: int, tab_name: str = "Entries") -> dict:
     """Get income/expense totals by category for a given month."""
     worksheet = _get_entries_worksheet(tab_name)
@@ -381,6 +425,17 @@ async def delete_rows(row_numbers: list[int], tab_name: str = "Entries") -> int:
 async def delete_last_entry(tab_name: str = "Entries") -> dict | None:
     """Delete the last entry. Returns the deleted data or None."""
     return await asyncio.to_thread(_delete_last_row_sync, tab_name)
+
+
+async def get_rows_data(
+    row_numbers: list[int], tab_name: str = "Entries",
+) -> list[dict]:
+    """Fetch entry-shaped dicts for specific sheet row numbers (live state).
+
+    Each returned dict either has the full entry fields plus 'row_number',
+    or just {'row_number': N, 'missing': True} if the row doesn't exist.
+    """
+    return await asyncio.to_thread(_get_rows_data_sync, row_numbers, tab_name)
 
 
 async def get_recent_entries(days: int = 90, tab_name: str = "Entries") -> list[dict]:

@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     raw_summary     TEXT NOT NULL DEFAULT '',
     sheet_rows_json TEXT NOT NULL DEFAULT '[]',
     tab_name        TEXT NOT NULL DEFAULT 'Entries',
+    user_id         INTEGER,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -81,6 +82,16 @@ async def init_db() -> None:
             logger.info("op=init_db | Migrated: added tab_name column")
         except Exception:
             pass  # Column already exists
+        # Migration: add user_id column (nullable — legacy rows have no value
+        # and the @-mention will simply be skipped for them).
+        try:
+            await conn.execute(
+                "ALTER TABLE conversations ADD COLUMN user_id INTEGER"
+            )
+            await conn.commit()
+            logger.info("op=init_db | Migrated: added user_id column")
+        except Exception:
+            pass  # Column already exists
         await conn.commit()
     logger.info("op=init_db | Database initialised at %s", DB_PATH)
 
@@ -98,8 +109,14 @@ async def create_conversation(
     questions: list[str],
     raw_summary: str,
     tab_name: str = "Entries",
+    user_id: int | None = None,
 ) -> int:
-    """Insert a new conversation row. Returns the conversation id."""
+    """Insert a new conversation row. Returns the conversation id.
+
+    `user_id` is the Discord user ID of the person who posted the original
+    message that started the thread. Stored so we can @-mention them when
+    the bot needs their input.
+    """
     now = _now()
     async with aiosqlite.connect(DB_PATH) as conn:
         cursor = await conn.execute(
@@ -107,8 +124,8 @@ async def create_conversation(
             INSERT INTO conversations
                 (thread_id, message_url, original_text, status,
                  entries_json, confidence, questions_json, raw_summary,
-                 tab_name, created_at, updated_at)
-            VALUES (?, ?, ?, 'pending_clarification', ?, ?, ?, ?, ?, ?, ?)
+                 tab_name, user_id, created_at, updated_at)
+            VALUES (?, ?, ?, 'pending_clarification', ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 thread_id,
@@ -119,13 +136,17 @@ async def create_conversation(
                 json.dumps(questions),
                 raw_summary,
                 tab_name,
+                user_id,
                 now,
                 now,
             ),
         )
         await conn.commit()
         row_id = cursor.lastrowid
-    logger.info("thread=%d op=create_conversation | id=%d, tab=%s", thread_id, row_id, tab_name)
+    logger.info(
+        "thread=%d op=create_conversation | id=%d, tab=%s, user_id=%s",
+        thread_id, row_id, tab_name, user_id,
+    )
     return row_id
 
 
@@ -254,6 +275,106 @@ async def update_conversation_questions(
             (json.dumps(questions), _now(), thread_id),
         )
         await conn.commit()
+
+
+async def get_stuck_conversations(max_age_days: int = 14) -> list[dict]:
+    """Find conversations that were created but never updated, meaning the
+    bot died mid-pipeline (OOM kill, deploy, crash) after writing the row
+    but before posting the response to Discord.
+
+    Used by startup recovery to repost the saved bot response to each thread.
+    Filters out conversations older than max_age_days to avoid surprising the
+    user with stale messages.
+    """
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """
+            SELECT * FROM conversations
+            WHERE status = 'pending_clarification'
+              AND created_at = updated_at
+              AND julianday('now') - julianday(created_at) < ?
+            ORDER BY created_at ASC
+            """,
+            (max_age_days,),
+        )
+        rows = await cursor.fetchall()
+    return [_row_to_conversation(row) for row in rows]
+
+
+async def set_user_id(thread_id: int, user_id: int) -> None:
+    """Backfill the user_id on a conversation that was created before the
+    column existed (or for any other reason). One-shot: future-proofs the
+    @-mention path without requiring a separate migration script.
+    """
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "UPDATE conversations SET user_id = ?, updated_at = ? WHERE thread_id = ?",
+            (user_id, _now(), thread_id),
+        )
+        await conn.commit()
+    logger.info(
+        "thread=%d op=set_user_id | backfilled user_id=%s",
+        thread_id, user_id,
+    )
+
+
+async def touch_conversation(thread_id: int) -> None:
+    """Bump updated_at on a conversation without changing anything else.
+
+    Used by startup recovery to mark a stuck conversation as 'recovered'
+    (breaks the created_at == updated_at invariant we use to detect stuck rows).
+    """
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "UPDATE conversations SET updated_at = ? WHERE thread_id = ?",
+            (_now(), thread_id),
+        )
+        await conn.commit()
+
+
+async def delete_conversation(thread_id: int) -> dict | None:
+    """Delete a conversation row and its chat history, returning the deleted
+    row (for audit logging) or None if it didn't exist.
+
+    Used when the user asks to retry — we wipe the stale state so the fresh
+    extraction can insert cleanly via `db.create_conversation`. The media_cache
+    rows for the parent message_id are intentionally kept (they're keyed by
+    message_id, not thread_id, and may be re-used).
+    """
+    existing = await get_conversation(thread_id)
+    if existing is None:
+        return None
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "DELETE FROM conversation_messages WHERE thread_id = ?",
+            (thread_id,),
+        )
+        await conn.execute(
+            "DELETE FROM conversations WHERE thread_id = ?",
+            (thread_id,),
+        )
+        await conn.commit()
+    logger.info(
+        "thread=%d op=delete_conversation | status was %s, %d sheet rows",
+        thread_id, existing["status"], len(existing.get("sheet_row_numbers") or []),
+    )
+    return existing
+
+
+async def get_last_bot_message(thread_id: int) -> str | None:
+    """Return the most recent bot message content for a thread, or None."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cursor = await conn.execute(
+            """
+            SELECT content FROM conversation_messages
+            WHERE thread_id = ? AND role = 'bot'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (thread_id,),
+        )
+        row = await cursor.fetchone()
+    return row[0] if row else None
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,9 @@ Coordinates between db.py (state), gemini_processor.py (AI), and
 sheets_manager.py (Google Sheets). main.py delegates all logic here.
 """
 
+import gc
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -22,6 +24,36 @@ CONFIRM_WORDS = frozenset({
     "yes", "y", "confirm", "correct", "ok", "looks good",
     "lgtm", "approve", "yep", "yeah",
 })
+
+# Strip trailing punctuation/emoji-ish chars before checking for confirmation
+# words, so "yes!" / "Yes." / "yes," all count.
+_TRAILING_PUNCT_RE = re.compile(r"[!?.,;:\s\u2019\u2018\u201c\u201d]+$")
+# Max length for the "first word counts" heuristic. Short messages like
+# "yes please" should confirm, but "yes but the amount is wrong" must NOT —
+# that's a correction with caveats, which Gemini will handle properly.
+_AFFIRMATIVE_FIRST_WORD_MAX_LEN = 20
+
+
+def _is_affirmative(text: str | None) -> bool:
+    """Return True if `text` is unambiguously a confirmation reply.
+
+    Accepts variations users actually type ("yes!", "Yes.", "yes please",
+    "yeah") without being so loose that "yes but the amount is wrong" gets
+    misclassified as confirmation. When in doubt, return False — the
+    downstream Gemini correction call handles edge cases correctly.
+    """
+    if not text:
+        return False
+    cleaned = _TRAILING_PUNCT_RE.sub("", text.strip().lower()).strip()
+    if not cleaned:
+        return False
+    if cleaned in CONFIRM_WORDS:
+        return True
+    if len(cleaned) <= _AFFIRMATIVE_FIRST_WORD_MAX_LEN:
+        first_word = cleaned.split(maxsplit=1)[0]
+        if first_word in CONFIRM_WORDS:
+            return True
+    return False
 
 
 @dataclass
@@ -165,8 +197,28 @@ def _find_duplicates(
     """Compare new entries against recent sheet entries for potential duplicates.
 
     Returns list of (new_entry_index, matching_existing_entry) pairs.
-    Match criteria: same amount (within $0.01) AND same date (within 1 day) AND
-    at least one of: same client/event, same vendor, or same category+type.
+
+    Match criteria (ALL must hold):
+      1. Amount equal within $0.01.
+      2. Date EXACTLY equal (same calendar day, no fuzziness).
+      3. A NAME match: same client/event OR same vendor (substring either way,
+         case-insensitive).
+
+    Design history:
+      - We previously also matched on type+category alone. That dropped real
+        income because different students paying the same rate on adjacent
+        days were collapsed. Removed.
+      - We previously allowed ±1 day on the date to catch receipt OCR errors.
+        That collapsed weekly-recurring payments from the same client (e.g.
+        Guangling Li sends $240 every Sunday — entries 7 days apart, but if
+        one extraction lands on Saturday and another on Sunday, the 1-day
+        window silently merged them). Removed.
+
+    The bias is intentional:
+      - False negative (a real duplicate slips through) → user sees an extra
+        row, deletes it manually. Low cost.
+      - False positive (a real entry silently dropped) → user may never
+        notice the missing tax record. High cost.
     """
     matches: list[tuple[int, dict]] = []
 
@@ -178,51 +230,49 @@ def _find_duplicates(
             except ValueError:
                 new_amount = 0.0
 
+        new_date_str = new_entry.get("date", "")
         try:
-            new_date = datetime.strptime(new_entry.get("date", ""), "%Y-%m-%d")
+            datetime.strptime(new_date_str, "%Y-%m-%d")
         except ValueError:
-            new_date = None
+            continue  # No usable date — can't safely dedupe
 
         new_client = (new_entry.get("client_or_event") or "").strip().lower()
         new_vendor = (new_entry.get("vendor") or "").strip().lower()
-        new_type = (new_entry.get("type") or "").strip().lower()
-        new_category = (new_entry.get("category") or "").strip().lower()
 
         for existing in recent_entries:
             # Amount must match within $0.01
             if abs(new_amount - existing["amount"]) > 0.01:
                 continue
 
-            # Date must be within 1 day
-            if new_date is not None:
-                try:
-                    existing_date = datetime.strptime(existing["date"], "%Y-%m-%d")
-                except ValueError:
-                    continue
-                if abs((new_date - existing_date).days) > 1:
-                    continue
-            else:
+            # Date must be EXACTLY equal (same calendar day)
+            if existing.get("date") != new_date_str:
                 continue
 
-            # At least one contextual field must match
             existing_client = (existing.get("client_or_event") or "").strip().lower()
             existing_vendor = (existing.get("vendor") or "").strip().lower()
-            existing_type = (existing.get("type") or "").strip().lower()
-            existing_category = (existing.get("category") or "").strip().lower()
 
-            client_match = (
+            client_match = bool(
                 new_client and existing_client
                 and (new_client in existing_client or existing_client in new_client)
             )
-            vendor_match = (
+            vendor_match = bool(
                 new_vendor and existing_vendor
                 and (new_vendor in existing_vendor or existing_vendor in new_vendor)
             )
-            type_category_match = (
-                new_type == existing_type and new_category == existing_category
-            )
 
-            if client_match or vendor_match or type_category_match:
+            if client_match or vendor_match:
+                reason = "client" if client_match else "vendor"
+                logger.info(
+                    "op=dedupe_match | entry[%d] (%s | %s | $%.2f) matched existing "
+                    "row (%s | %s | $%.2f) via %s name (exact date)",
+                    i, new_date_str,
+                    new_client or new_vendor or "(no name)",
+                    new_amount,
+                    existing.get("date"),
+                    existing_client or existing_vendor or "(no name)",
+                    existing["amount"],
+                    reason,
+                )
                 matches.append((i, existing))
                 break  # One match per new entry is enough
 
@@ -363,14 +413,19 @@ async def create_entry(
     images: list[tuple[bytes, str]] | None,
     audio: tuple[bytes, str] | None,
     tab_name: str = "Entries",
+    user_id: int | None = None,
 ) -> ProcessingResult:
     """Process a new message: transcribe media, extract data, decide save vs ask.
 
     Called by main.py when a new message arrives in the expenses channel.
+    `user_id` is the Discord ID of the original poster, captured at thread
+    creation and stored on the conversation so we can @-mention them later
+    when the bot needs their input.
     """
     t0 = time.monotonic()
 
-    # 1. Transcribe audio if present (and cache)
+    # 1. Transcribe audio if present (and cache). Drop audio bytes immediately
+    # after — they're not needed again, only the transcription is.
     audio_transcription: str | None = None
     if audio:
         audio_bytes, mime_type = audio
@@ -378,8 +433,20 @@ async def create_entry(
             audio_bytes, mime_type
         )
         await db.cache_media(message_id, "audio", audio_transcription, mime_type)
+    audio = None
+    gc.collect()
 
-    # 2. Describe images (and cache) — but still send raw bytes for extraction
+    # 1b. Resize all images upfront, then drop the original raw bytes. This
+    # is the most important memory mitigation on the 256MB VM: a 4MB phone
+    # photo decodes to ~37MB of raw RGB in Pillow; keeping the originals
+    # around AND doing this work inside describe/extract caused an OOM
+    # (incident 2026-05-18 05:04). After this step `images` holds small
+    # (~300KB) JPEG bytes that can flow through the rest of the pipeline
+    # without further resize work.
+    images = await gemini_processor.preprocess_images(images)
+    gc.collect()
+
+    # 2. Describe images (and cache)
     if images:
         for img_bytes, mime_type in images:
             description = await gemini_processor.describe_image(img_bytes, mime_type)
@@ -391,6 +458,12 @@ async def create_entry(
         images=images,
         audio_transcription=audio_transcription,
     )
+
+    # Free image bytes once extraction is done
+    if images:
+        images.clear()
+    images = None
+    gc.collect()
 
     # 4. Convert entries to dicts for storage
     entries_dicts = [e.model_dump() for e in result.entries]
@@ -405,6 +478,7 @@ async def create_entry(
         questions=result.clarifying_questions,
         raw_summary=result.raw_summary,
         tab_name=tab_name,
+        user_id=user_id,
     )
 
     # 6. Record the initial bot response in conversation history
@@ -536,13 +610,37 @@ async def process_reply(
     # 1. Load conversation state from SQLite
     conv = await db.get_conversation(thread_id)
     if conv is None:
-        logger.warning("thread=%d op=process_reply | No conversation found", thread_id)
+        # Orphan thread — typically because the bot was OOM-killed before it
+        # could write the conversation row. The user is in this thread for a
+        # reason (the parent message), so the only useful thing we can do is
+        # re-process the parent. Return a signal to main.py which has the
+        # Discord context needed to fetch the parent and re-extract.
+        logger.info(
+            "thread=%d op=process_reply | Orphan thread, signalling retry",
+            thread_id,
+        )
         return ProcessingResult(
-            response_text=(
-                "Sorry, I couldn't find the context for this thread. "
-                "Please create a new entry in the main channel."
-            ),
-            status="error",
+            response_text="",
+            status="retry_orphan",
+        )
+
+    # 1b. Refuse replies in already-deleted threads. The user explicitly
+    # deleted these entries; subsequent corrections would either re-create
+    # state (confusing) or do nothing. Direct them to start fresh.
+    # Use a dedicated status so main.py knows to leave the parent's 🗑️
+    # emoji alone (status="saved" would flip it back to ✅).
+    if conv["status"] == "deleted":
+        logger.info(
+            "thread=%d op=process_reply | Reply in deleted thread, refusing",
+            thread_id,
+        )
+        response_text = (
+            "This entry was deleted. To create a new one, send a fresh "
+            "message in the main channel."
+        )
+        return ProcessingResult(
+            response_text=response_text,
+            status="deleted_ack",
         )
 
     entries = conv["entries"]
@@ -565,18 +663,36 @@ async def process_reply(
         )
 
     if images:
+        # Resize upfront and drop originals before describe_image runs — same
+        # memory-safety pattern used in create_entry.
+        images = await gemini_processor.preprocess_images(images)
+        gc.collect()
         for img_bytes, mime_type in images:
             description = await gemini_processor.describe_image(img_bytes, mime_type)
             if message_id:
                 await db.cache_media(message_id, "image", description, mime_type)
             correction_text = f"{correction_text}\n[Image]: {description}".strip()
 
+    # Free media bytes — they've been transcribed/described and cached in SQLite.
+    if images:
+        images.clear()
+    images = None
+    audio = None
+    gc.collect()
+
     # 3. Record user message (with transcription context)
     await db.add_message(thread_id, "user", correction_text)
 
-    # 4. Check for skip/discard (duplicate rejection)
+    # 4. Check for skip/discard (duplicate rejection). Exclude any state
+    # where a specific confirmation gate (retry/delete) is pending — otherwise
+    # "no" / "nope" would hit the skip path instead of cancelling the gate.
     text_to_check = correction_text.strip().lower()
-    if text_to_check in SKIP_WORDS and conv["status"] != "saved":
+    if (
+        text_to_check in SKIP_WORDS
+        and conv["status"] not in (
+            "saved", "pending_retry_confirm", "pending_delete_confirm",
+        )
+    ):
         await db.update_conversation_status(thread_id, "skipped")
         response_text = "Got it — this entry has been discarded and won't be saved."
         await db.add_message(thread_id, "bot", response_text)
@@ -593,17 +709,85 @@ async def process_reply(
             audio_transcription=reply_transcription,
         )
 
-    # 5. Check for simple confirmation
+    # 5. Check for simple confirmation. Exclude any state where a specific
+    # confirmation gate is pending — "yes" there means "confirm THAT action",
+    # not "confirm the save". Each gate handles its own affirmative check.
     if (
-        text_to_check in CONFIRM_WORDS
+        _is_affirmative(text_to_check)
         and len(entries) > 0
-        and conv["status"] != "saved"
+        and conv["status"] not in (
+            "saved", "pending_retry_confirm", "pending_delete_confirm",
+        )
     ):
         # If user is confirming after a duplicate warning, force save without re-checking
         force = conv["status"] == "pending_duplicate_review"
         result = await _confirm_and_save(thread_id, conv, t0, force_save=force)
         result.audio_transcription = reply_transcription
         return result
+
+    # 5b. Handle the "confirm destructive retry" gate.
+    # When the user previously asked to retry an already-saved entry, we set
+    # status to 'pending_retry_confirm' and asked them to confirm. Now their
+    # reply tells us whether to proceed.
+    if conv["status"] == "pending_retry_confirm":
+        if _is_affirmative(text_to_check):
+            logger.info(
+                "thread=%d op=process_reply | Retry confirmed by user (text=%r)",
+                thread_id, correction_text[:50],
+            )
+            return ProcessingResult(
+                response_text="",
+                status="retry_confirmed",
+                audio_transcription=reply_transcription,
+            )
+        # Anything other than confirm cancels the retry and reverts state.
+        # Log the rejected text at INFO so debugging future "I said yes!" issues
+        # is straightforward.
+        logger.info(
+            "thread=%d op=process_reply | Retry NOT confirmed; reverting to saved "
+            "(text=%r)", thread_id, correction_text[:50],
+        )
+        await db.update_conversation_status(thread_id, "saved")
+        response_text = (
+            "OK, cancelled the retry. The saved entry stays as-is. "
+            "Reply if you want to make targeted corrections instead, or say "
+            "**retry** again if you actually did mean to reprocess."
+        )
+        await db.add_message(thread_id, "bot", response_text)
+        return ProcessingResult(
+            response_text=response_text,
+            status="saved",
+            audio_transcription=reply_transcription,
+        )
+
+    # 5c. Handle the "confirm destructive delete" gate. Same pattern as 5b.
+    if conv["status"] == "pending_delete_confirm":
+        if _is_affirmative(text_to_check):
+            logger.info(
+                "thread=%d op=process_reply | Delete confirmed by user (text=%r)",
+                thread_id, correction_text[:50],
+            )
+            return ProcessingResult(
+                response_text="",
+                status="delete_confirmed",
+                audio_transcription=reply_transcription,
+            )
+        logger.info(
+            "thread=%d op=process_reply | Delete NOT confirmed; reverting to saved "
+            "(text=%r)", thread_id, correction_text[:50],
+        )
+        await db.update_conversation_status(thread_id, "saved")
+        response_text = (
+            "OK, cancelled the delete. The saved entry stays as-is. "
+            "Reply if you want to make targeted corrections instead, or say "
+            "**delete** again if you actually did mean to remove it."
+        )
+        await db.add_message(thread_id, "bot", response_text)
+        return ProcessingResult(
+            response_text=response_text,
+            status="saved",
+            audio_transcription=reply_transcription,
+        )
 
     # 6. Field-level correction via Gemini
     conversation_history = await db.get_messages(thread_id)
@@ -612,6 +796,54 @@ async def process_reply(
         conversation_history=conversation_history,
         user_reply=correction_text,
     )
+
+    # 6b. Did Gemini classify this as a retry request? If so, surface it to
+    # main.py which has the Discord context to refetch the parent message.
+    if followup.is_retry_request:
+        logger.info(
+            "thread=%d op=process_reply | Gemini classified reply as retry intent",
+            thread_id,
+        )
+        if conv["status"] == "saved" and conv.get("sheet_row_numbers"):
+            # Saved entries need explicit confirmation before we destroy them.
+            return ProcessingResult(
+                response_text="",
+                status="retry_needs_confirm",
+                audio_transcription=reply_transcription,
+            )
+        return ProcessingResult(
+            response_text="",
+            status="retry_active",
+            audio_transcription=reply_transcription,
+        )
+
+    # 6c. Did Gemini classify this as a delete request?
+    if followup.is_delete_request:
+        logger.info(
+            "thread=%d op=process_reply | Gemini classified reply as delete intent",
+            thread_id,
+        )
+        if conv["status"] == "saved" and conv.get("sheet_row_numbers"):
+            # Saved entries need explicit confirmation before we remove them
+            # from the spreadsheet.
+            return ProcessingResult(
+                response_text="",
+                status="delete_needs_confirm",
+                audio_transcription=reply_transcription,
+            )
+        # Unsaved entry — nothing on the sheet to remove. Just discard the
+        # conversation state, no confirmation needed.
+        await db.update_conversation_status(thread_id, "deleted")
+        response_text = (
+            ":wastebasket: Got it — this entry has been discarded and won't "
+            "be saved."
+        )
+        await db.add_message(thread_id, "bot", response_text)
+        return ProcessingResult(
+            response_text=response_text,
+            status="deleted_ack",
+            audio_transcription=reply_transcription,
+        )
 
     # 7. Handle pure confirmation from Gemini
     if followup.is_confirmation and not followup.field_updates:
@@ -635,12 +867,22 @@ async def process_reply(
         field_name = update.field_name
         new_value: str | float | None = update.new_value
 
-        # Type coercion for amount
+        # Type coercion for amount. If Gemini returns something we can't
+        # parse to a positive float (e.g. empty string, "TBD"), DROP the
+        # update entirely — silently storing an unparseable value would
+        # corrupt the row and break later saves (see 2026-05-07
+        # "Remove it entirely" incident where amount became "" and the
+        # entry became un-saveable).
         if field_name == "amount":
             try:
                 new_value = float(str(new_value).replace("$", "").replace(",", ""))
-            except ValueError:
-                pass
+            except (ValueError, TypeError):
+                logger.warning(
+                    "thread=%d op=process_reply | Gemini returned unparseable "
+                    "amount %r — skipping this field_update to avoid corrupting "
+                    "the entry", thread_id, update.new_value,
+                )
+                continue  # skip; leave the existing amount untouched
 
         # Handle null/empty
         if field_name in ("client_or_event", "vendor", "mode_of_payment"):
@@ -668,6 +910,26 @@ async def process_reply(
         )
         result.audio_transcription = reply_transcription
         return result
+
+    # 9b. Sheet-sync drift fix: for ALREADY-SAVED entries with new field
+    # changes, mirror the change to the sheet immediately even though we
+    # still have remaining clarifying questions. Otherwise SQLite and the
+    # sheet drift out of sync — see the 5/6 "amount: 350 -> 0" incident
+    # where the user was shown $0 in a later delete confirmation but the
+    # sheet still held the real $350 row.
+    if conv.get("sheet_row_numbers") and fields_changed:
+        tab_name = conv.get("tab_name", "Entries")
+        for i, row_num in enumerate(conv["sheet_row_numbers"]):
+            if i < len(entries):
+                try:
+                    await sheets_manager.update_entry_in_place(
+                        row_num, entries[i], message_url, tab_name=tab_name,
+                    )
+                except Exception:
+                    logger.exception(
+                        "thread=%d op=sync_to_sheet | Failed to mirror "
+                        "in-flight correction to row %d", thread_id, row_num,
+                    )
 
     # 10. Still have questions — ask them
     response_text = _format_correction_message(
